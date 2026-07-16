@@ -9,10 +9,11 @@ What it does:
   - Wraps the scripts/authentik-migrate/*.sh toolkit (backup / restore /
     repoint-caddy) behind a wizard page reachable from a "Migrate" button on
     the Authentik page.
-  - Backs up Authentik wherever it currently lives (local or the console's
-    configured remote), copies the tarball to a brand-new target machine over
-    SSH, restores it there, and repoints Caddy + console settings at the new
-    machine.
+  - Backs up Authentik wherever it currently lives — the "current machine",
+    detected automatically from infra-TAK's existing Authentik deployment
+    config (local or remote) — copies the tarball to a "new machine" you
+    enter SSH details for in the wizard, restores it there, and repoints
+    Caddy + console settings at that new machine.
   - Ships a self-update action that git-pulls this module's own source repo
     and re-syncs it into the running console (see install.sh), so the module
     can be updated from a button instead of SSHing in by hand.
@@ -89,14 +90,14 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
 
     os.makedirs(WORK_DIR, exist_ok=True)
 
-    def _target_cfg():
-        return _load_state(load_settings).get('target', {}) or {}
+    def _new_machine_cfg():
+        return _load_state(load_settings).get('new_machine', {}) or {}
 
-    def _ssh_target_ok(cfg):
+    def _ssh_new_machine_ok(cfg):
         host = (cfg.get('host') or '').strip()
         return bool(host)
 
-    def _scp_to_target(cfg, local_path, remote_path):
+    def _scp_to_new_machine(cfg, local_path, remote_path):
         host = cfg['host']
         user = (cfg.get('ssh_user') or 'root').strip() or 'root'
         port = str(int(cfg.get('ssh_port') or 22))
@@ -121,19 +122,19 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         state = _load_state(load_settings)
         return render_template_string(
             MIGRATE_TEMPLATE,
-            target=state.get('target', {}),
+            new_machine=state.get('new_machine', {}),
             last_backup=state.get('last_backup'),
             chosen_ip=state.get('chosen_ip'),
         )
 
     # ------------------------------------------------------------------
-    # Target machine SSH setup
+    # New machine SSH setup (the destination you're migrating Authentik to)
     # ------------------------------------------------------------------
-    @app.route('/api/authentik/migrate/target', methods=['POST'])
+    @app.route('/api/authentik/migrate/new-machine', methods=['POST'])
     @login_required
-    def authentik_migrate_save_target():
+    def authentik_migrate_save_new_machine():
         data = request.get_json() or {}
-        target = {
+        new_machine = {
             'host': (data.get('host') or '').strip(),
             'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
             'ssh_port': int(data.get('ssh_port') or 22),
@@ -141,38 +142,38 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'ssh_key_path': (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip(),
             'ssh_password': data.get('ssh_password') or '',
         }
-        _save_state(load_settings, save_settings, target=target)
+        _save_state(load_settings, save_settings, new_machine=new_machine)
         return jsonify({'success': True})
 
-    @app.route('/api/authentik/migrate/target/test-ssh', methods=['POST'])
+    @app.route('/api/authentik/migrate/new-machine/test-ssh', methods=['POST'])
     @login_required
-    def authentik_migrate_test_ssh():
-        cfg = _target_cfg()
-        if not _ssh_target_ok(cfg):
-            return jsonify({'error': 'Target host not configured'}), 400
+    def authentik_migrate_test_new_machine_ssh():
+        cfg = _new_machine_cfg()
+        if not _ssh_new_machine_ok(cfg):
+            return jsonify({'error': 'New machine host not configured'}), 400
         ok, out = ssh_probe(cfg, 'echo ok && uname -a', timeout=15)
         return jsonify({'success': ok, 'output': out})
 
     # ------------------------------------------------------------------
-    # Step 1 — backup the source (wherever Authentik currently lives)
+    # Step 1 — back up the current machine (wherever Authentik lives today)
     # ------------------------------------------------------------------
     def _run_backup():
         MIGRATE_STATE.update({'running': True, 'stage': 'backup', 'complete': False, 'error': False})
         MIGRATE_LOG.clear()
         try:
             settings = load_settings()
-            src_cfg = get_deploy_cfg(settings, 'authentik_deployment')
+            current_cfg = get_deploy_cfg(settings, 'authentik_deployment')
             backup_script = os.path.join(SCRIPTS_DIR, 'authentik-backup.sh')
-            if src_cfg.get('target_mode') == 'remote' and (src_cfg.get('remote', {}).get('host') or '').strip():
-                remote = src_cfg['remote']
-                _mlog(f"Source is remote ({remote.get('host')}) — copying backup script over...")
-                ok, out = _scp_to_target(remote, backup_script, '/root/authentik-backup.sh')
+            if current_cfg.get('target_mode') == 'remote' and (current_cfg.get('remote', {}).get('host') or '').strip():
+                current = current_cfg['remote']
+                _mlog(f"Current machine is remote ({current.get('host')}) — copying backup script over...")
+                ok, out = _scp_to_new_machine(current, backup_script, '/root/authentik-backup.sh')
                 if not ok:
-                    _mlog(f'ERROR: could not copy backup script to source: {out}')
+                    _mlog(f'ERROR: could not copy backup script to current machine: {out}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
-                _mlog('Running backup on source host (pg_dump, no downtime)...')
-                ok, out = ssh_probe(remote, 'bash /root/authentik-backup.sh /root', timeout=600)
+                _mlog('Running backup on the current machine (pg_dump, no downtime)...')
+                ok, out = ssh_probe(current, 'bash /root/authentik-backup.sh /root', timeout=600)
                 _mlog(out)
                 if not ok:
                     MIGRATE_STATE.update({'running': False, 'error': True})
@@ -185,24 +186,24 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 remote_tarball = m.group(1)
                 local_tarball = os.path.join(WORK_DIR, os.path.basename(remote_tarball))
                 _mlog(f'Pulling {remote_tarball} back to console...')
-                user = (remote.get('ssh_user') or 'root').strip() or 'root'
-                port = str(int(remote.get('ssh_port') or 22))
-                key_path = (remote.get('ssh_key_path') or '').strip()
+                user = (current.get('ssh_user') or 'root').strip() or 'root'
+                port = str(int(current.get('ssh_port') or 22))
+                key_path = (current.get('ssh_key_path') or '').strip()
                 scp_cmd = ['scp', '-P', port, '-o', 'StrictHostKeyChecking=accept-new']
                 if key_path:
                     scp_cmd.extend(['-i', os.path.expanduser(key_path)])
-                scp_cmd.extend([f'{user}@{remote["host"]}:{remote_tarball}', local_tarball])
+                scp_cmd.extend([f'{user}@{current["host"]}:{remote_tarball}', local_tarball])
                 env = os.environ.copy()
-                if (remote.get('auth_method') or 'ssh_key') == 'password' and remote.get('ssh_password'):
+                if (current.get('auth_method') or 'ssh_key') == 'password' and current.get('ssh_password'):
                     scp_cmd = ['sshpass', '-e'] + scp_cmd
-                    env['SSHPASS'] = remote['ssh_password']
+                    env['SSHPASS'] = current['ssh_password']
                 r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=600, env=env)
                 if r.returncode != 0:
                     _mlog(f'ERROR: failed to pull tarball back: {r.stderr}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
             else:
-                _mlog('Source is local — running backup on this machine (pg_dump, no downtime)...')
+                _mlog('Current machine is this console — running backup locally (pg_dump, no downtime)...')
                 ok, out = _run_local(f'bash "{backup_script}" "{WORK_DIR}"', timeout=600)
                 _mlog(out)
                 if not ok:
@@ -241,37 +242,37 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return send_file(path, as_attachment=True)
 
     # ------------------------------------------------------------------
-    # Step 2 — copy + restore on the target
+    # Step 2 — copy + restore on the new machine
     # ------------------------------------------------------------------
     def _run_restore():
         MIGRATE_STATE.update({'running': True, 'stage': 'restore', 'complete': False, 'error': False})
         MIGRATE_LOG.clear()
         try:
-            cfg = _target_cfg()
-            if not _ssh_target_ok(cfg):
-                _mlog('ERROR: target host not configured')
+            cfg = _new_machine_cfg()
+            if not _ssh_new_machine_ok(cfg):
+                _mlog('ERROR: new machine not configured — fill in step 1 first')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             state = _load_state(load_settings)
             tarball = (state.get('last_backup') or {}).get('path')
             if not tarball or not os.path.exists(tarball):
-                _mlog('ERROR: no backup on hand — run Backup first')
+                _mlog('ERROR: no backup on hand — run the backup step first')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             restore_script = os.path.join(SCRIPTS_DIR, 'authentik-restore.sh')
             remote_tarball = f'/root/{os.path.basename(tarball)}'
             _mlog(f'Copying backup + restore script to {cfg["host"]}...')
-            ok, out = _scp_to_target(cfg, tarball, remote_tarball)
+            ok, out = _scp_to_new_machine(cfg, tarball, remote_tarball)
             if not ok:
                 _mlog(f'ERROR copying tarball: {out}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
-            ok, out = _scp_to_target(cfg, restore_script, '/root/authentik-restore.sh')
+            ok, out = _scp_to_new_machine(cfg, restore_script, '/root/authentik-restore.sh')
             if not ok:
                 _mlog(f'ERROR copying restore script: {out}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
-            _mlog('Running restore on target (Docker install if needed, DB restore, stack up)...')
+            _mlog('Running restore on the new machine (Docker install if needed, DB restore, stack up)...')
             ok, out = ssh_probe(cfg, f'bash /root/authentik-restore.sh {remote_tarball}', timeout=900)
             _mlog(out)
             if not ok:
@@ -282,7 +283,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 m = re.search(r"This machine's IPs:\s*(.+)", out)
                 if m:
                     ips = [t.split()[0] for t in m.group(1).split() if _IP_RE.match(t.split()[0])]
-            _mlog(f'Candidate IPs for repoint: {ips or "none detected — enter manually"}')
+            _mlog(f'Candidate IPs for the next step (point console + Caddy): {ips or "none detected — enter manually"}')
             _save_state(load_settings, save_settings, candidate_ips=ips)
             MIGRATE_STATE.update({'running': False, 'complete': True, 'stage': 'restore'})
         except Exception as e:
@@ -298,7 +299,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return jsonify({'success': True})
 
     # ------------------------------------------------------------------
-    # Step 3 — repoint Caddy + console settings at the new machine
+    # Step 3 — point Caddy + console settings at the new machine
     # ------------------------------------------------------------------
     def _run_repoint(new_ip):
         MIGRATE_STATE.update({'running': True, 'stage': 'repoint', 'complete': False, 'error': False})
@@ -309,7 +310,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             repoint_script = os.path.join(SCRIPTS_DIR, 'authentik-repoint-caddy.sh')
-            _mlog(f'Repointing console + Caddy at {new_ip}:9090...')
+            _mlog(f'Pointing console + Caddy at {new_ip}:9090...')
             ok, out = _run_local(f'bash "{repoint_script}" {new_ip}', timeout=60)
             _mlog(out)
             MIGRATE_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'stage': 'repoint'})
@@ -459,55 +460,55 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 <body>
 <a class="back" href="/authentik">&larr; Back to Authentik</a>
 <h1>Migrate Authentik to a new machine</h1>
-<div class="sub">Backs up Authentik wherever it runs today, restores it on a brand-new box, then repoints Caddy + this console. Mirrors scripts/authentik-migrate — nothing here touches the source machine destructively.</div>
+<div class="sub">Backs up Authentik from the machine it runs on today (detected automatically — no input needed), restores it on the new machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the current machine destructively.</div>
 
 <div class="card">
-  <div class="card-title">1 &middot; Target machine</div>
+  <div class="card-title">1 &middot; New machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine you're moving Authentik TO)</span></div>
   <div class="row">
     <div style="flex:2">
       <label class="form-label">Host / IP</label>
-      <input class="form-input" id="tgt-host" placeholder="192.0.2.10" value="{{ target.host or '' }}">
+      <input class="form-input" id="new-host" placeholder="192.0.2.10" value="{{ new_machine.host or '' }}">
     </div>
     <div>
       <label class="form-label">SSH user</label>
-      <input class="form-input" id="tgt-user" value="{{ target.ssh_user or 'root' }}">
+      <input class="form-input" id="new-user" value="{{ new_machine.ssh_user or 'root' }}">
     </div>
     <div>
       <label class="form-label">SSH port</label>
-      <input class="form-input" id="tgt-port" value="{{ target.ssh_port or 22 }}">
+      <input class="form-input" id="new-port" value="{{ new_machine.ssh_port or 22 }}">
     </div>
   </div>
   <label class="form-label">Auth</label>
-  <select class="form-input" id="tgt-auth">
-    <option value="ssh_key" {% if target.auth_method != 'password' %}selected{% endif %}>SSH key</option>
-    <option value="password" {% if target.auth_method == 'password' %}selected{% endif %}>Password</option>
+  <select class="form-input" id="new-auth">
+    <option value="ssh_key" {% if new_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
+    <option value="password" {% if new_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
-  <input class="form-input" id="tgt-key" placeholder="~/.ssh/id_ed25519" value="{{ target.ssh_key_path or '~/.ssh/id_ed25519' }}">
-  <input class="form-input" id="tgt-pass" type="password" placeholder="SSH password (if using password auth)">
-  <button class="btn btn-ghost" onclick="saveTarget()">Save target</button>
-  <button class="btn btn-ghost" onclick="testSsh()">Test SSH</button>
+  <input class="form-input" id="new-key" placeholder="~/.ssh/id_ed25519" value="{{ new_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
+  <input class="form-input" id="new-pass" type="password" placeholder="SSH password (if using password auth)">
+  <button class="btn btn-ghost" onclick="saveNewMachine()">Save new machine</button>
+  <button class="btn btn-ghost" onclick="testNewMachineSsh()">Test SSH</button>
   <span id="ssh-status" class="status"></span>
 </div>
 
 <div class="card">
-  <div class="card-title">2 &middot; Backup source</div>
-  <div class="hint">Runs on whichever machine hosts Authentik today (local or the console's configured remote). Live pg_dump, no downtime.</div>
+  <div class="card-title">2 &middot; Back up the current machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(wherever Authentik runs today)</span></div>
+  <div class="hint">Auto-detected from infra-TAK's existing Authentik deployment config (local or remote) — nothing to fill in here. Live pg_dump, no downtime.</div>
   {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
   <button class="btn btn-primary" id="btn-backup" onclick="runStep('backup')">Run backup</button>
   <a href="/api/authentik/migrate/backup/download"><button class="btn btn-ghost" {% if not last_backup %}disabled{% endif %}>Download tarball</button></a>
 </div>
 
 <div class="card">
-  <div class="card-title">3 &middot; Restore on target</div>
-  <div class="hint">Copies the backup + installs Docker if needed, restores the DB before Authentik ever boots against it, brings the stack up.</div>
-  <button class="btn btn-primary" id="btn-restore" onclick="runStep('restore')">Copy + restore on target</button>
+  <div class="card-title">3 &middot; Restore on the new machine</div>
+  <div class="hint">Copies the backup + installs Docker if needed, restores the DB before Authentik ever boots against it, brings the stack up. Uses the new machine from step 1.</div>
+  <button class="btn btn-primary" id="btn-restore" onclick="runStep('restore')">Copy + restore on new machine</button>
 </div>
 
 <div class="card">
-  <div class="card-title">4 &middot; Repoint console + Caddy</div>
-  <div class="hint">Runs locally on this console. Enter the IP the restore step reported (or 127.0.0.1 if the target IS this machine).</div>
-  <input class="form-input" id="repoint-ip" placeholder="New Authentik IP" value="{{ chosen_ip or '' }}">
-  <button class="btn btn-primary" id="btn-repoint" onclick="runRepoint()">Repoint now</button>
+  <div class="card-title">4 &middot; Point console + Caddy at the new machine</div>
+  <div class="hint">Runs locally on this console. Enter the IP the restore step reported (or 127.0.0.1 if the new machine IS this console).</div>
+  <input class="form-input" id="caddy-ip" placeholder="New Authentik IP" value="{{ chosen_ip or '' }}">
+  <button class="btn btn-primary" id="btn-repoint" onclick="runRepoint()">Point console + Caddy now</button>
 </div>
 
 <div class="card">
@@ -532,24 +533,24 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </div>
 
 <script>
-function collectTarget(){
+function collectNewMachine(){
   return {
-    host: document.getElementById('tgt-host').value.trim(),
-    ssh_user: document.getElementById('tgt-user').value.trim() || 'root',
-    ssh_port: parseInt(document.getElementById('tgt-port').value) || 22,
-    auth_method: document.getElementById('tgt-auth').value,
-    ssh_key_path: document.getElementById('tgt-key').value.trim(),
-    ssh_password: document.getElementById('tgt-pass').value,
+    host: document.getElementById('new-host').value.trim(),
+    ssh_user: document.getElementById('new-user').value.trim() || 'root',
+    ssh_port: parseInt(document.getElementById('new-port').value) || 22,
+    auth_method: document.getElementById('new-auth').value,
+    ssh_key_path: document.getElementById('new-key').value.trim(),
+    ssh_password: document.getElementById('new-pass').value,
   };
 }
-function saveTarget(){
-  fetch('/api/authentik/migrate/target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectTarget()),credentials:'same-origin'})
+function saveNewMachine(){
+  fetch('/api/authentik/migrate/new-machine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectNewMachine()),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{document.getElementById('ssh-status').textContent=d.success?'saved':'error';});
 }
-function testSsh(){
+function testNewMachineSsh(){
   var st=document.getElementById('ssh-status'); st.textContent='testing...'; st.className='status';
-  saveTarget();
-  fetch('/api/authentik/migrate/target/test-ssh',{method:'POST',credentials:'same-origin'})
+  saveNewMachine();
+  fetch('/api/authentik/migrate/new-machine/test-ssh',{method:'POST',credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{ st.textContent=d.success?'reachable':('failed: '+(d.output||d.error||'')); st.className='status '+(d.success?'ok':'err'); });
 }
 var pollTimer=null;
@@ -572,7 +573,7 @@ function runStep(step){
 }
 function runRepoint(){
   setButtons(true);
-  var ip=document.getElementById('repoint-ip').value.trim();
+  var ip=document.getElementById('caddy-ip').value.trim();
   fetch('/api/authentik/migrate/repoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:ip}),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{
       if(d.error){ alert(d.error); setButtons(false); return; }
