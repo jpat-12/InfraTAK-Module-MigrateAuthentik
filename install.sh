@@ -74,7 +74,8 @@ cp -f "$SRC_DIR/migrate_authentik.py" "$CONSOLE_DIR/migrate_authentik.py"
 mkdir -p "$CONSOLE_DIR/scripts/authentik-migrate"
 cp -f "$SRC_DIR/scripts/"*.sh "$CONSOLE_DIR/scripts/authentik-migrate/"
 chmod +x "$CONSOLE_DIR/scripts/authentik-migrate/"*.sh
-echo "==> Synced migrate_authentik.py + scripts/authentik-migrate/*.sh"
+MODULE_VERSION="$(grep -m1 '^MODULE_VERSION' "$CONSOLE_DIR/migrate_authentik.py" | sed -E "s/.*= *'([^']+)'.*/\1/")"
+echo "==> Synced migrate_authentik.py (v${MODULE_VERSION:-unknown}) + scripts/authentik-migrate/*.sh"
 
 # --- 4. Patch app.py (idempotent) ---------------------------------------
 python3 - "$CONSOLE_DIR/app.py" <<'PYEOF'

@@ -1,5 +1,12 @@
 # InfraTAK-Module-MigrateAuthentik
 
+**Current version: 1.1.0** — shown in the wizard page header (`v1.1.0` next
+to the title) and printed by `install.sh` after every sync. Bumped on every
+change that ships to installed consoles; no separate CHANGELOG, the commit
+log is the changelog. `MODULE_VERSION` in `migrate_authentik.py` is the
+single source of truth — `install.sh` and the self-update log both read it
+back out with `grep` rather than tracking it separately.
+
 Adds a **"🔁 Migrate"** button to the Authentik page of an
 [infra-TAK](https://github.com/jpat-12/infra-TAK) console. It moves an
 Authentik deployment to a different machine — backup, copy, restore,

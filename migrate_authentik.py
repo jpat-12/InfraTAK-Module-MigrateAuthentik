@@ -29,6 +29,11 @@ import subprocess
 import threading
 import time
 
+# Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
+# This is the single source of truth — install.sh reads it back out of this file with
+# grep, no separate VERSION file to keep in sync.
+MODULE_VERSION = '1.1.0'
+
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
 MODULE_CHECKOUT_DIR = os.path.expanduser('~/.infra-tak-modules/migrate-authentik')
@@ -125,7 +130,13 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             new_machine=state.get('new_machine', {}),
             last_backup=state.get('last_backup'),
             chosen_ip=state.get('chosen_ip'),
+            module_version=MODULE_VERSION,
         )
+
+    @app.route('/api/authentik/migrate/version')
+    @login_required
+    def authentik_migrate_version():
+        return jsonify({'version': MODULE_VERSION})
 
     # ------------------------------------------------------------------
     # New Authentik Machine SSH setup (the destination you're migrating Authentik to)
@@ -353,12 +364,19 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 _sulog(f'ERROR: module checkout not found at {MODULE_CHECKOUT_DIR}. Run install.sh once by hand first.')
                 SELF_UPDATE_STATE.update({'running': False, 'error': True})
                 return
-            _sulog('git pull on module repo + re-sync into console...')
+            _sulog(f'Currently installed: v{MODULE_VERSION}. git pull on module repo + re-sync into console...')
             ok, out = _run_local(f'bash "{install_sh}" --sync', timeout=180)
             _sulog(out)
             if not ok:
                 SELF_UPDATE_STATE.update({'running': False, 'error': True})
                 return
+            new_console_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'migrate_authentik.py')
+            ok_v, new_version_out = _run_local(
+                f"grep -m1 \"^MODULE_VERSION\" \"{new_console_file}\" | sed -E \"s/.*= *'([^']+)'.*/\\1/\"",
+                timeout=10,
+            )
+            new_version = new_version_out.strip() if ok_v else '?'
+            _sulog(f'Synced version: v{new_version}' + (' (unchanged)' if new_version == MODULE_VERSION else ' (updated)'))
             _sulog(f'Restarting {CONSOLE_SERVICE} to load any route/UI changes...')
             ok2, out2 = _run_local(f'systemctl restart {CONSOLE_SERVICE}', timeout=30)
             _sulog(out2 or ('ok' if ok2 else 'restart command failed'))
@@ -459,7 +477,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </style></head>
 <body>
 <a class="back" href="/authentik">&larr; Back to Authentik</a>
-<h1>Migrate Authentik to a New Authentik Machine</h1>
+<h1>Migrate Authentik to a New Authentik Machine <span style="font-size:11px;font-weight:400;color:var(--text-dim);font-family:'JetBrains Mono',monospace">v{{ module_version }}</span></h1>
 <div class="sub">Backs up Authentik from the Old Authentik Machine (detected automatically — no input needed), restores it on the New Authentik Machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the old machine destructively.</div>
 
 <div class="card">
