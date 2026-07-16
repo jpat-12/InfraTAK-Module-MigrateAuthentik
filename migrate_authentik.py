@@ -161,6 +161,51 @@ def _install_ssh_key_via_password(cfg, host, one_time_password):
     return True, None
 
 
+def _ssh_auth_summary(cfg):
+    """One-line description of the credentials an SSH/SCP call will actually use,
+    so backup logs show the real auth path instead of leaving us to infer it from
+    a generic 'Permission denied'."""
+    user = (cfg.get('ssh_user') or 'root').strip() or 'root'
+    host = (cfg.get('host') or '?').strip()
+    port = int(cfg.get('ssh_port') or 22)
+    method = (cfg.get('auth_method') or 'ssh_key')
+    if method == 'password':
+        has_pw = bool((cfg.get('ssh_password') or '').strip())
+        return f'{user}@{host}:{port} via password auth (password {"present" if has_pw else "MISSING/blank"})'
+    key_path = (cfg.get('ssh_key_path') or '').strip() or '(none set)'
+    exists = os.path.exists(os.path.expanduser(key_path)) if key_path != '(none set)' else False
+    return f'{user}@{host}:{port} via SSH key {key_path} ({"found on console" if exists else "NOT FOUND on console"})'
+
+
+def _scp(cfg, src, dst, timeout=600):
+    """SCP one endpoint to another using cfg's auth. Unlike a bare scp, this makes
+    the chosen auth method authoritative: with key auth it refuses to silently fall
+    back to a password prompt (which produced the misleading 'please try again'
+    spam), so a rejection reads honestly as 'Permission denied (publickey)'."""
+    port = str(int(cfg.get('ssh_port') or 22))
+    key_path = (cfg.get('ssh_key_path') or '').strip()
+    method = (cfg.get('auth_method') or 'ssh_key')
+    use_password = method == 'password' and (cfg.get('ssh_password') or '').strip()
+    scp_cmd = ['scp', '-P', port, '-o', 'StrictHostKeyChecking=accept-new']
+    if use_password:
+        # sshpass drives an interactive password prompt, so don't force BatchMode.
+        scp_cmd += ['-o', 'PubkeyAuthentication=no']
+    else:
+        # Key auth: fail cleanly on the key rather than dropping to a password
+        # prompt we can't answer, and only offer the key we were told to use.
+        if key_path:
+            scp_cmd += ['-i', os.path.expanduser(key_path), '-o', 'IdentitiesOnly=yes']
+        scp_cmd += ['-o', 'PasswordAuthentication=no', '-o', 'KbdInteractiveAuthentication=no',
+                    '-o', 'BatchMode=yes']
+    scp_cmd += [src, dst]
+    env = os.environ.copy()
+    if use_password:
+        scp_cmd = ['sshpass', '-e'] + scp_cmd
+        env['SSHPASS'] = cfg['ssh_password']
+    r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=timeout, env=env)
+    return r.returncode == 0, ((r.stdout or '') + (r.stderr or ''))
+
+
 def register_routes(app, login_required, load_settings, save_settings, ssh_probe, get_deploy_cfg):
     from flask import request, jsonify, render_template_string, send_file
 
@@ -184,20 +229,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return bool(host)
 
     def _scp_to_new_machine(cfg, local_path, remote_path):
-        host = cfg['host']
-        user = (cfg.get('ssh_user') or 'root').strip() or 'root'
-        port = str(int(cfg.get('ssh_port') or 22))
-        key_path = (cfg.get('ssh_key_path') or '').strip()
-        scp_cmd = ['scp', '-P', port, '-o', 'StrictHostKeyChecking=accept-new']
-        if key_path:
-            scp_cmd.extend(['-i', os.path.expanduser(key_path)])
-        scp_cmd.extend([local_path, f'{user}@{host}:{remote_path}'])
-        env = os.environ.copy()
-        if (cfg.get('auth_method') or 'ssh_key') == 'password' and cfg.get('ssh_password'):
-            scp_cmd = ['sshpass', '-e'] + scp_cmd
-            env['SSHPASS'] = cfg['ssh_password']
-        r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=600, env=env)
-        return r.returncode == 0, ((r.stdout or '') + (r.stderr or ''))
+        return _scp(cfg, local_path, f'{(cfg.get("ssh_user") or "root").strip() or "root"}@{cfg["host"]}:{remote_path}')
 
     # ------------------------------------------------------------------
     # Page
@@ -364,6 +396,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
                 _mlog(f"Old Authentik Machine is remote ({current.get('host')}) — copying backup script over...")
+                _mlog(f'Authenticating to Old Authentik Machine: {_ssh_auth_summary(current)}')
                 ok, out = _scp_to_new_machine(current, backup_script, '/root/authentik-backup.sh')
                 if not ok:
                     hint = _diagnose_ssh_failure(out)
@@ -390,19 +423,12 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 local_tarball = os.path.join(WORK_DIR, os.path.basename(remote_tarball))
                 _mlog(f'Pulling {remote_tarball} back to console...')
                 user = (current.get('ssh_user') or 'root').strip() or 'root'
-                port = str(int(current.get('ssh_port') or 22))
-                key_path = (current.get('ssh_key_path') or '').strip()
-                scp_cmd = ['scp', '-P', port, '-o', 'StrictHostKeyChecking=accept-new']
-                if key_path:
-                    scp_cmd.extend(['-i', os.path.expanduser(key_path)])
-                scp_cmd.extend([f'{user}@{current["host"]}:{remote_tarball}', local_tarball])
-                env = os.environ.copy()
-                if (current.get('auth_method') or 'ssh_key') == 'password' and current.get('ssh_password'):
-                    scp_cmd = ['sshpass', '-e'] + scp_cmd
-                    env['SSHPASS'] = current['ssh_password']
-                r = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=600, env=env)
-                if r.returncode != 0:
-                    _mlog(f'ERROR: failed to pull tarball back: {r.stderr}')
+                ok, out = _scp(current, f'{user}@{current["host"]}:{remote_tarball}', local_tarball)
+                if not ok:
+                    hint = _diagnose_ssh_failure(out)
+                    _mlog(f'ERROR: failed to pull tarball back: {out}')
+                    if hint:
+                        _mlog(f'HINT: {hint}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
             else:
@@ -470,6 +496,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             restore_script = os.path.join(SCRIPTS_DIR, 'authentik-restore.sh')
             remote_tarball = f'/root/{os.path.basename(tarball)}'
             _mlog(f'Copying backup + restore script to {cfg["host"]}...')
+            _mlog(f'Authenticating to New Authentik Machine: {_ssh_auth_summary(cfg)}')
             ok, out = _scp_to_new_machine(cfg, tarball, remote_tarball)
             if not ok:
                 hint = _diagnose_ssh_failure(out)
