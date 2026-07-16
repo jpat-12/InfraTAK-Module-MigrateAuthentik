@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.10.1'
+MODULE_VERSION = '1.10.2'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -364,7 +364,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
             'ssh_port': int(data.get('ssh_port') or 22),
             'auth_method': (data.get('auth_method') or 'ssh_key').strip(),
-            'ssh_key_path': (data.get('ssh_key_path') or '/root/.ssh/infra-tak-authentik-migrate').strip(),
+            'ssh_key_path': (data.get('ssh_key_path') or '/root/.ssh/infra-tak-authentik').strip(),
             # Browsers never re-fill a password field after reload, so a blank
             # submission means "unchanged", not "clear it".
             'ssh_password': submitted_password or (_load_state(load_settings).get('old_machine') or {}).get('ssh_password', ''),
@@ -376,14 +376,14 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     @login_required
     def authentik_migrate_old_machine_ensure_ssh_key():
         cfg = _old_machine_cfg()
-        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '/root/.ssh/infra-tak-authentik-migrate')
+        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '/root/.ssh/infra-tak-authentik')
         pub = kp + '.pub'
         if not os.path.exists(kp):
             kdir = os.path.dirname(kp)
             if kdir and not os.path.isdir(kdir):
                 os.makedirs(kdir, mode=0o700, exist_ok=True)
             try:
-                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-authentik-migrate'],
+                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-authentik'],
                                capture_output=True, text=True, timeout=30, check=True)
             except Exception as e:
                 return jsonify({'success': False, 'error': f'ssh-keygen failed: {e}'}), 500
@@ -902,7 +902,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
     <option value="ssh_key" {% if old_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
     <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
-  <input class="form-input" id="old-key" placeholder="/root/.ssh/infra-tak-authentik-migrate" value="{{ old_machine.ssh_key_path or '/root/.ssh/infra-tak-authentik-migrate' }}">
+  <input class="form-input" id="old-key" placeholder="/root/.ssh/infra-tak-authentik" value="{{ old_machine.ssh_key_path or '/root/.ssh/infra-tak-authentik' }}">
   <div style="display:flex;gap:8px;align-items:center">
     <input class="form-input" id="old-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
     <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('old-pass', this)">show</button>
@@ -911,7 +911,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save Old Authentik Machine</button>
   <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
   <span id="old-ssh-status" class="status"></span>
-  <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have one yet? Generate a migration key here, then install it using the password once — after that you never need the password again.</div>
+  <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have a key yet? Generate one here (defaults to /root/.ssh/infra-tak-authentik), then install it using the password once — after that you never need the password again.</div>
   <button class="btn btn-ghost" type="button" onclick="generateOldMachineSshKey()">Generate SSH key</button>
   <button class="btn btn-ghost" type="button" onclick="installOldMachineSshKey()">Install SSH key (uses password above, once)</button>
   <textarea class="form-input" id="old-pubkey" readonly rows="2" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;resize:vertical" placeholder="Public key appears here after Generate"></textarea>
@@ -1042,10 +1042,10 @@ function testOldMachineSsh(){
   });
 }
 function generateOldMachineSshKey(){
-  // Generates a dedicated migration key (infra-tak-authentik-migrate) owned by
-  // this wizard, saved onto the Old Authentik Machine config -- NOT the console's
-  // shared Authentik-remote key. Save the form first so the key lands on the
-  // host you actually typed.
+  // Ensures the Old Authentik Machine key (defaults to /root/.ssh/infra-tak-authentik,
+  // the existing key for that box -- reused if already present, generated if not) and
+  // saves it onto the Old Authentik Machine config. Save the form first so the key
+  // lands on the host you actually typed.
   var st=document.getElementById('old-ssh-status'); st.textContent='generating key...'; st.className='status';
   saveOldMachineCreds(function(){
     fetch('/api/authentik/migrate/old-machine/ensure-ssh-key',{method:'POST',credentials:'same-origin'})
