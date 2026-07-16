@@ -1,7 +1,7 @@
 # InfraTAK-Module-MigrateAuthentik
 
 Adds a **"🔁 Migrate"** button to the Authentik page of an
-[infra-TAK](https://github.com/takwerx/infra-TAK) console. It moves an
+[infra-TAK](https://github.com/jpat-12/infra-TAK) console. It moves an
 Authentik deployment to a different machine — backup, copy, restore,
 cutover — from the console UI instead of SSHing in and running scripts by
 hand, and can pull its own updates into a running console with one click.
@@ -66,6 +66,22 @@ To update from the command line instead:
 sudo bash ~/.infra-tak-modules/migrate-authentik/install.sh
 ```
 
+## Uninstall
+
+From the wizard page (`/authentik/migrate`), scroll to **Remove module** and
+click **Uninstall module**. It removes the button and this module's routes
+from `app.py`, deletes `migrate_authentik.py` from the console, and restarts
+`takwerx-console` — same as running `uninstall.sh` by hand:
+
+```bash
+sudo bash ~/.infra-tak-modules/migrate-authentik/uninstall.sh
+```
+
+Uninstalling does **not** touch `scripts/authentik-migrate/*.sh` (that's
+infra-TAK's own migration toolkit, not owned by this module) and does not
+undo anything a migration you already ran did — it only removes the
+console integration. Safe to run even if the module isn't installed.
+
 ## Using the wizard
 
 1. **Target machine** — enter the new box's host/IP and SSH credentials
@@ -93,3 +109,4 @@ sudo bash ~/.infra-tak-modules/migrate-authentik/install.sh
   `authentik-repoint-caddy.sh` — the migration toolkit these routes wrap
   (also runnable standalone, same as in infra-TAK proper).
 - `install.sh` — install/update entry point (see above).
+- `uninstall.sh` — removes the module's console integration (see above).
