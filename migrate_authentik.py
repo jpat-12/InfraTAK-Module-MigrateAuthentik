@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.3.0'
+MODULE_VERSION = '1.4.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -50,7 +50,7 @@ _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
 # In-memory state for the wizard's live log panel — mirrors the pattern used
 # by authentik_deploy_log/authentik_deploy_status elsewhere in the console.
 MIGRATE_LOG = []
-MIGRATE_STATE = {'running': False, 'stage': None, 'complete': False, 'error': False}
+MIGRATE_STATE = {'running': False, 'stage': None, 'complete': False, 'error': False, 'needs_force': False}
 
 SELF_UPDATE_LOG = []
 SELF_UPDATE_STATE = {'running': False, 'complete': False, 'error': False, 'restarted': False}
@@ -255,8 +255,8 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     # ------------------------------------------------------------------
     # Step 2 — copy + restore on the New Authentik Machine
     # ------------------------------------------------------------------
-    def _run_restore():
-        MIGRATE_STATE.update({'running': True, 'stage': 'restore', 'complete': False, 'error': False})
+    def _run_restore(force=False):
+        MIGRATE_STATE.update({'running': True, 'stage': 'restore', 'complete': False, 'error': False, 'needs_force': False})
         MIGRATE_LOG.clear()
         try:
             cfg = _new_machine_cfg()
@@ -283,11 +283,18 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 _mlog(f'ERROR copying restore script: {out}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
+            force_flag = ' --force' if force else ''
+            if force:
+                _mlog('Running restore with --force: this WIPES the New Authentik Machine\'s current ~/authentik (containers stopped, database volumes deleted) before restoring from the backup.')
             _mlog('Running restore on the New Authentik Machine (Docker install if needed, DB restore, stack up)...')
-            ok, out = ssh_probe(cfg, f'bash /root/authentik-restore.sh {remote_tarball}', timeout=900)
+            ok, out = ssh_probe(cfg, f'bash /root/authentik-restore.sh {remote_tarball}{force_flag}', timeout=900)
             _mlog(out)
             if not ok:
-                MIGRATE_STATE.update({'running': False, 'error': True})
+                if not force and 'already exists' in out and '--force' in out:
+                    _mlog('Authentik is already installed on the New Authentik Machine. Re-run with --force to overwrite it (this deletes its current database volumes — not your backup).')
+                    MIGRATE_STATE.update({'running': False, 'error': True, 'needs_force': True})
+                else:
+                    MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             ips = re.findall(r'^\s*\d+\)\s+([0-9.]+)', out, re.MULTILINE)
             if not ips:
@@ -306,7 +313,9 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     def authentik_migrate_restore():
         if MIGRATE_STATE.get('running'):
             return jsonify({'error': 'Migration step already in progress'}), 409
-        threading.Thread(target=_run_restore, daemon=True).start()
+        data = request.get_json() or {}
+        force = bool(data.get('force'))
+        threading.Thread(target=_run_restore, args=(force,), daemon=True).start()
         return jsonify({'success': True})
 
     # ------------------------------------------------------------------
@@ -349,6 +358,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'entries': MIGRATE_LOG[idx:], 'total': len(MIGRATE_LOG),
             'running': MIGRATE_STATE['running'], 'stage': MIGRATE_STATE['stage'],
             'complete': MIGRATE_STATE['complete'], 'error': MIGRATE_STATE['error'],
+            'needs_force': MIGRATE_STATE['needs_force'],
         })
 
     # ------------------------------------------------------------------
@@ -604,6 +614,13 @@ function pollLog(){
         var next = {backup:'step-restore', restore:'step-repoint', repoint:'step-done'}[d.stage || pollStage];
         if(next === 'step-done') document.getElementById('step-done').style.display='';
         if(next) setTimeout(function(){ goToStep(next); }, 400);
+      } else if(d.error && d.needs_force){
+        setTimeout(function(){
+          goToStep('step-log');
+          if(confirm('Authentik is already installed on the New Authentik Machine. Overwrite it with this backup?\\n\\nThis stops its containers and DELETES its current database volumes on the NEW machine — the backup you\\'re restoring is not affected.')){
+            runStep('restore', {force:true});
+          }
+        }, 300);
       } else if(d.error){
         setTimeout(function(){ goToStep('step-log'); }, 300);
       }
@@ -613,10 +630,10 @@ function pollLog(){
 function setButtons(disabled){
   ['btn-backup','btn-restore','btn-repoint'].forEach(id=>document.getElementById(id).disabled=disabled);
 }
-function runStep(step){
+function runStep(step, extraBody){
   setButtons(true);
   pollStage=step;
-  fetch('/api/authentik/migrate/'+step,{method:'POST',credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+  fetch('/api/authentik/migrate/'+step,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(extraBody||{}),credentials:'same-origin'}).then(r=>r.json()).then(d=>{
     if(d.error){ alert(d.error); setButtons(false); return; }
     goToStep('step-log');
     pollTimer=setInterval(pollLog,1500); pollLog();

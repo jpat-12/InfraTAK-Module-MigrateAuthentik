@@ -50,6 +50,12 @@ fi
 docker compose version >/dev/null 2>&1 || { echo "ERROR: docker compose plugin missing" >&2; exit 1; }
 echo "==> $(docker --version)"
 
+# docker-compose.yml declares `infratak` as an external network — the infra-TAK
+# console normally creates this the first time any module is deployed on a
+# machine, but a fresh migration target may never have run infra-TAK before.
+docker network inspect infratak >/dev/null 2>&1 || docker network create infratak
+echo "==> Ensured docker network 'infratak' exists"
+
 # --- 2. Unpack ---
 if [ -f "$AK_DIR/docker-compose.yml" ]; then
     if [ "$FORCE" != "--force" ]; then
