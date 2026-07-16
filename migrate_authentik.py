@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.6.0'
+MODULE_VERSION = '1.6.1'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -145,16 +145,21 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     @login_required
     def authentik_migrate_save_new_machine():
         data = request.get_json() or {}
+        # Browsers never refill a password input after a page reload, so a
+        # blank submission here almost always means "unchanged", not "clear
+        # it" -- keep whatever was previously saved unless a new value was
+        # actually typed in.
+        submitted_password = data.get('ssh_password') or ''
         new_machine = {
             'host': (data.get('host') or '').strip(),
             'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
             'ssh_port': int(data.get('ssh_port') or 22),
             'auth_method': (data.get('auth_method') or 'ssh_key').strip(),
             'ssh_key_path': (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip(),
-            'ssh_password': data.get('ssh_password') or '',
+            'ssh_password': submitted_password or _new_machine_cfg().get('ssh_password', ''),
         }
         _save_state(load_settings, save_settings, new_machine=new_machine)
-        return jsonify({'success': True})
+        return jsonify({'success': True, 'password_kept': bool(not submitted_password and new_machine['ssh_password'])})
 
     @app.route('/api/authentik/migrate/new-machine/test-ssh', methods=['POST'])
     @login_required
@@ -355,9 +360,16 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                         ak_cfg['remote'] = remote
                         settings2['authentik_deployment'] = ak_cfg
                         save_settings(settings2)
-                        _mlog("Copied the New Authentik Machine's SSH credentials into the console's "
-                              "Authentik deployment target, so Update Config & Reconnect / logs / "
-                              "control work without re-entering them.")
+                        if remote['auth_method'] == 'password' and not remote['ssh_password']:
+                            _mlog("WARNING: New Authentik Machine uses password auth but no password is "
+                                  "currently saved (likely lost on a page reload — the password field "
+                                  "never re-fills). Re-enter it in step 1 and Save New Authentik Machine "
+                                  "again, or Update Config & Reconnect will fail with a misleading "
+                                  "'no token' error.")
+                        else:
+                            _mlog("Copied the New Authentik Machine's SSH credentials into the console's "
+                                  "Authentik deployment target, so Update Config & Reconnect / logs / "
+                                  "control work without re-entering them.")
             MIGRATE_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'stage': 'repoint'})
         except Exception as e:
             _mlog(f'ERROR: {e}')
@@ -571,7 +583,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
     <option value="password" {% if new_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
   <input class="form-input" id="new-key" placeholder="~/.ssh/id_ed25519" value="{{ new_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
-  <input class="form-input" id="new-pass" type="password" placeholder="SSH password (if using password auth)">
+  <input class="form-input" id="new-pass" type="password" placeholder="{% if new_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
   <button class="btn btn-ghost" onclick="saveNewMachine()">Save New Authentik Machine</button>
   <button class="btn btn-ghost" onclick="testNewMachineSsh()">Test SSH</button>
   <span id="ssh-status" class="status"></span>
