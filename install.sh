@@ -83,18 +83,18 @@ with open(path, 'r', encoding='utf-8') as f:
 
 MARKER = '[migrate_authentik] Failed to register'
 if MARKER not in src:
-    anchor = "_startup_migrations()"
+    anchor = "print(f'[esri] Failed to register Esri CoT Bridge module: {_e}', flush=True)\n"
     if anchor not in src:
-        print("ERROR: could not find startup anchor in app.py — module registration NOT applied", file=sys.stderr)
+        print("ERROR: could not find esri registration anchor in app.py — module registration NOT applied", file=sys.stderr)
         sys.exit(1)
     block = (
-        "try:\n"
+        "\ntry:\n"
         "    import migrate_authentik as _migrate_authentik_module\n"
         "    _migrate_authentik_module.register_routes(app, login_required, load_settings, save_settings, _ssh_probe, _get_module_deployment_config)\n"
         "except Exception as _e:\n"
-        "    print(f'[migrate_authentik] Failed to register Migrate Authentik module: {_e}', flush=True)\n\n"
+        "    print(f'[migrate_authentik] Failed to register Migrate Authentik module: {_e}', flush=True)\n"
     )
-    src = src.replace(anchor, block + anchor, 1)
+    src = src.replace(anchor, anchor + block, 1)
     print("    + registered migrate_authentik.register_routes()")
 else:
     print("    = module registration already present")
