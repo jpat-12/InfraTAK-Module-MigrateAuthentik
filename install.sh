@@ -26,23 +26,26 @@ set -euo pipefail
 MODULE_CHECKOUT_DIR="${MODULE_CHECKOUT_DIR:-$HOME/.infra-tak-modules/migrate-authentik}"
 MODULE_REPO_URL="${MODULE_REPO_URL:-https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git}"
 CONSOLE_SERVICE="${CONSOLE_SERVICE:-takwerx-console}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: run as root (sudo bash $0 $*)" >&2
     exit 1
 fi
 
-# --- 1. Canonical checkout ---------------------------------------------
+# --- 1. Canonical checkout -----------------------------------------------
+# Always tracks $MODULE_REPO_URL directly (never a local directory) so the
+# in-console "Download changes" button reliably pulls from GitHub. If an
+# earlier version of this script left the checkout pointed at a local path
+# (e.g. wherever you first ran install.sh from), self-heal it here.
 if [ -d "$MODULE_CHECKOUT_DIR/.git" ]; then
-    echo "==> Updating module checkout at $MODULE_CHECKOUT_DIR..."
-    git -C "$MODULE_CHECKOUT_DIR" pull --ff-only
-elif [ -d "$SCRIPT_DIR/.git" ]; then
-    if [ "$SCRIPT_DIR" != "$MODULE_CHECKOUT_DIR" ]; then
-        echo "==> Cloning this checkout into canonical location $MODULE_CHECKOUT_DIR..."
-        mkdir -p "$(dirname "$MODULE_CHECKOUT_DIR")"
-        git clone "$SCRIPT_DIR" "$MODULE_CHECKOUT_DIR"
+    CURRENT_ORIGIN="$(git -C "$MODULE_CHECKOUT_DIR" remote get-url origin 2>/dev/null || true)"
+    if [ "$CURRENT_ORIGIN" != "$MODULE_REPO_URL" ]; then
+        echo "==> Module checkout's origin was '$CURRENT_ORIGIN' (not GitHub) — fixing..."
+        git -C "$MODULE_CHECKOUT_DIR" remote set-url origin "$MODULE_REPO_URL"
     fi
+    echo "==> Updating module checkout at $MODULE_CHECKOUT_DIR..."
+    git -C "$MODULE_CHECKOUT_DIR" fetch origin
+    git -C "$MODULE_CHECKOUT_DIR" reset --hard origin/master
 else
     echo "==> No git checkout found — cloning $MODULE_REPO_URL into $MODULE_CHECKOUT_DIR..."
     mkdir -p "$(dirname "$MODULE_CHECKOUT_DIR")"
