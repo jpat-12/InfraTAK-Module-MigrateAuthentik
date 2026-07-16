@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.9.2'
+MODULE_VERSION = '1.9.3'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -976,7 +976,7 @@ function generateOldMachineSshKey(){
       if(d.key_path) document.getElementById('old-key').value=d.key_path;
       document.getElementById('old-auth').value='ssh_key';
       document.getElementById('old-pubkey').value=d.public_key||'';
-      st.textContent='key ready and saved as this target\'s auth method'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
+      st.textContent='key ready, saved as this target auth method'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
     });
 }
 function installOldMachineSshKey(){
