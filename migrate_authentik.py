@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.4.0'
+MODULE_VERSION = '1.5.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -468,7 +468,7 @@ MIGRATE_TEMPLATE = '''<!DOCTYPE html>
 <style>
 :root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
 *{box-sizing:border-box}
-body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;margin:0;padding:32px;max-width:920px}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;margin:0;padding:32px;width:100%}
 h1{font-size:20px;margin:0 0 4px}
 .sub{color:var(--text-dim);font-size:13px;margin-bottom:24px}
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:22px;margin-bottom:18px}
@@ -489,11 +489,42 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 .btn-danger{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
 .card{transition:box-shadow .4s,border-color .4s}
 .card.flash{box-shadow:0 0 0 2px var(--accent);border-color:var(--accent)}
+.page-header{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:24px}
+.settings-wrap{position:relative;flex-shrink:0}
+.settings-btn{width:38px;height:38px;border-radius:8px;background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text-secondary);font-size:17px;cursor:pointer;line-height:1}
+.settings-btn:hover{color:var(--text-primary);border-color:var(--text-dim)}
+.settings-panel{display:none;position:absolute;right:0;top:46px;width:380px;max-width:90vw;z-index:30;background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+.settings-panel.open{display:block}
+.settings-section + .settings-section{margin-top:18px;padding-top:18px;border-top:1px solid var(--border)}
+.settings-section .card-title{margin-bottom:10px}
 </style></head>
 <body>
-<a class="back" href="/authentik">&larr; Back to Authentik</a>
-<h1>Migrate Authentik to a New Authentik Machine <span style="font-size:11px;font-weight:400;color:var(--text-dim);font-family:'JetBrains Mono',monospace">v{{ module_version }}</span></h1>
-<div class="sub">Backs up Authentik from the Old Authentik Machine (detected automatically — no input needed), restores it on the New Authentik Machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the old machine destructively.</div>
+<div class="page-header">
+  <div>
+    <a class="back" href="/authentik">&larr; Back to Authentik</a>
+    <h1>Migrate Authentik to a New Authentik Machine <span style="font-size:11px;font-weight:400;color:var(--text-dim);font-family:'JetBrains Mono',monospace">v{{ module_version }}</span></h1>
+    <div class="sub" style="margin-bottom:0">Backs up Authentik from the Old Authentik Machine (detected automatically — no input needed), restores it on the New Authentik Machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the old machine destructively.</div>
+  </div>
+  <div class="settings-wrap">
+    <button type="button" class="settings-btn" id="settings-btn" onclick="toggleSettings(event)" title="Module updates &amp; removal">&#9881;</button>
+    <div class="settings-panel" id="settings-panel">
+      <div class="settings-section">
+        <div class="card-title">Module updates</div>
+        <div class="hint">Pulls the latest InfraTAK-Module-MigrateAuthentik changes and re-syncs them into this console (restarts the console service to load them).</div>
+        <button class="btn btn-ghost" id="btn-selfupdate" onclick="selfUpdate()">Download changes &amp; apply</button>
+        <span id="su-status" class="status"></span>
+        <pre id="su-log" style="margin-top:10px;display:none"></pre>
+      </div>
+      <div class="settings-section">
+        <div class="card-title">Remove module</div>
+        <div class="hint">Removes the Migrate button and this wizard from the console (restarts the console service). Does not touch scripts/authentik-migrate — that's infra-TAK's own toolkit — and does not undo any migration you already ran.</div>
+        <button class="btn btn-danger" id="btn-uninstall" onclick="uninstallModule()">Uninstall module</button>
+        <span id="ui-status" class="status"></span>
+        <pre id="ui-log" style="margin-top:10px;display:none"></pre>
+      </div>
+    </div>
+  </div>
+</div>
 
 <div class="card" id="step-new-machine">
   <div class="card-title">1 &middot; New Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine you're moving Authentik TO)</span></div>
@@ -554,23 +585,18 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine. Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
 </div>
 
-<div class="card">
-  <div class="card-title">Module updates</div>
-  <div class="hint">Pulls the latest InfraTAK-Module-MigrateAuthentik changes and re-syncs them into this console (restarts the console service to load them).</div>
-  <button class="btn btn-ghost" id="btn-selfupdate" onclick="selfUpdate()">Download changes &amp; apply</button>
-  <span id="su-status" class="status"></span>
-  <pre id="su-log" style="margin-top:10px;display:none"></pre>
-</div>
-
-<div class="card">
-  <div class="card-title">Remove module</div>
-  <div class="hint">Removes the Migrate button and this wizard from the console (restarts the console service). Does not touch scripts/authentik-migrate — that's infra-TAK's own toolkit — and does not undo any migration you already ran.</div>
-  <button class="btn btn-danger" id="btn-uninstall" onclick="uninstallModule()">Uninstall module</button>
-  <span id="ui-status" class="status"></span>
-  <pre id="ui-log" style="margin-top:10px;display:none"></pre>
-</div>
-
 <script>
+function toggleSettings(evt){
+  if(evt) evt.stopPropagation();
+  document.getElementById('settings-panel').classList.toggle('open');
+}
+document.addEventListener('click', function(evt){
+  var panel=document.getElementById('settings-panel');
+  var btn=document.getElementById('settings-btn');
+  if(panel.classList.contains('open') && !panel.contains(evt.target) && evt.target!==btn){
+    panel.classList.remove('open');
+  }
+});
 function collectNewMachine(){
   return {
     host: document.getElementById('new-host').value.trim(),
@@ -586,7 +612,8 @@ function goToStep(id){
   if(!el) return;
   el.scrollIntoView({behavior:'smooth', block:'start'});
   el.classList.add('flash');
-  setTimeout(function(){ el.classList.remove('flash'); }, 1600);
+  var clear=function(){ el.classList.remove('flash'); el.removeEventListener('click', clear); };
+  el.addEventListener('click', clear);
 }
 function saveNewMachine(){
   fetch('/api/authentik/migrate/new-machine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectNewMachine()),credentials:'same-origin'})
