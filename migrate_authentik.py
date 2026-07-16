@@ -22,6 +22,7 @@ Call register_routes(app, login_required, load_settings, save_settings,
                       ssh_probe, get_deploy_cfg) from app.py.
 """
 
+import copy
 import json
 import os
 import re
@@ -33,7 +34,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.10.2'
+MODULE_VERSION = '1.11.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -254,6 +255,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             old_machine=_old_machine_cfg(),
             last_backup=state.get('last_backup'),
             chosen_ip=state.get('chosen_ip'),
+            can_revert=bool(state.get('repoint_undo')),
             module_version=MODULE_VERSION,
         )
 
@@ -617,6 +619,15 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 _mlog(f'ERROR: invalid IP: {new_ip}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
+            # Snapshot where the console + Caddy point RIGHT NOW, before this
+            # repoint moves them, so "Revert" can put them back exactly as they
+            # were (including the SSH creds the repoint is about to overwrite).
+            pre_deploy = copy.deepcopy(load_settings().get('authentik_deployment') or {})
+            _save_state(load_settings, save_settings, repoint_undo={
+                'authentik_deployment': pre_deploy,
+                'chosen_ip': _load_state(load_settings).get('chosen_ip'),
+                'to_ip': new_ip,
+            })
             repoint_script = os.path.join(SCRIPTS_DIR, 'authentik-repoint-caddy.sh')
             _mlog(f'Pointing console + Caddy at {new_ip}:9090...')
             ok, out = _run_local(f'bash "{repoint_script}" {new_ip}', timeout=60)
@@ -666,6 +677,62 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         data = request.get_json() or {}
         new_ip = (data.get('ip') or '').strip()
         threading.Thread(target=_run_repoint, args=(new_ip,), daemon=True).start()
+        return jsonify({'success': True})
+
+    # ------------------------------------------------------------------
+    # Revert — undo the last repoint: point console + Caddy back at the Old
+    # Authentik Machine (which is still running; the migration never tears it
+    # down). Restores the exact deployment config captured before the repoint.
+    # ------------------------------------------------------------------
+    def _run_revert():
+        MIGRATE_STATE.update({'running': True, 'stage': 'revert', 'complete': False, 'error': False})
+        MIGRATE_LOG.clear()
+        try:
+            snap = _load_state(load_settings).get('repoint_undo')
+            if not snap:
+                _mlog('ERROR: nothing to revert — no prior repoint has been recorded on this console.')
+                MIGRATE_STATE.update({'running': False, 'error': True})
+                return
+            prev = snap.get('authentik_deployment') or {}
+            if prev.get('target_mode') == 'remote':
+                old_ip = ((prev.get('remote') or {}).get('host') or '').strip()
+            else:
+                old_ip = '127.0.0.1'
+            if not _IP_RE.match(old_ip):
+                _mlog(f'ERROR: the recorded previous Authentik IP is not usable ({old_ip!r}); cannot revert automatically.')
+                MIGRATE_STATE.update({'running': False, 'error': True})
+                return
+            repoint_script = os.path.join(SCRIPTS_DIR, 'authentik-repoint-caddy.sh')
+            _mlog(f'Reverting — pointing console + Caddy back at the Old Authentik Machine ({old_ip}:9090)...')
+            ok, out = _run_local(f'bash "{repoint_script}" {old_ip}', timeout=60)
+            _mlog(out)
+            if not ok:
+                _mlog('ERROR: repoint script failed — nothing was left half-applied (it rolls back its own '
+                      'Caddyfile edit on failure). Console + Caddy are unchanged.')
+                MIGRATE_STATE.update({'running': False, 'error': True})
+                return
+            # The script only rewrites host/target_mode; restore the full prior
+            # deployment (SSH creds included) so the console can still reach the
+            # old machine for Update Config & Reconnect / logs / control.
+            settings2 = load_settings()
+            settings2['authentik_deployment'] = prev
+            save_settings(settings2)
+            _save_state(load_settings, save_settings, chosen_ip=snap.get('chosen_ip'), repoint_undo=None)
+            _mlog('Revert complete — console + Caddy are back on the Old Authentik Machine, and its SSH '
+                  'credentials are restored. Run "Update Config & Reconnect" on the Authentik page to finish.')
+            MIGRATE_STATE.update({'running': False, 'complete': True, 'stage': 'revert'})
+        except Exception as e:
+            _mlog(f'ERROR: {e}')
+            MIGRATE_STATE.update({'running': False, 'error': True})
+
+    @app.route('/api/authentik/migrate/revert', methods=['POST'])
+    @login_required
+    def authentik_migrate_revert():
+        if MIGRATE_STATE.get('running'):
+            return jsonify({'error': 'Migration step already in progress'}), 409
+        if not (_load_state(load_settings).get('repoint_undo')):
+            return jsonify({'error': 'Nothing to revert — no prior repoint recorded.'}), 400
+        threading.Thread(target=_run_revert, daemon=True).start()
         return jsonify({'success': True})
 
     @app.route('/api/authentik/migrate/log')
@@ -935,6 +1002,12 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <button class="btn btn-primary" id="btn-repoint" onclick="runRepoint()">Point console + Caddy now</button>
 </div>
 
+<div class="card" id="step-revert" {% if not can_revert %}style="display:none"{% endif %}>
+  <div class="card-title">Revert <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(undo the repoint — point back at the Old Authentik Machine)</span></div>
+  <div class="hint">Points the console + Caddy back at the Old Authentik Machine and restores its saved SSH credentials. The old machine is untouched by the migration and still running, so this is a safe rollback if something's wrong on the new one. Only affects this console's routing — it does not delete anything on either machine.</div>
+  <button class="btn btn-ghost" id="btn-revert" onclick="revertMigration()">Revert to Old Authentik Machine</button>
+</div>
+
 <div class="card" id="step-log">
   <div class="card-title">Live log</div>
   <pre id="log">(idle)</pre>
@@ -1079,7 +1152,12 @@ function pollLog(){
     if(!d.running){
       clearInterval(pollTimer); setButtons(false);
       if(!d.error && d.complete){
-        var next = {backup:'step-restore', restore:'step-repoint', repoint:'step-done'}[d.stage || pollStage];
+        var stage = d.stage || pollStage;
+        // A completed repoint means there's now something to revert; a completed
+        // revert consumes it.
+        if(stage==='repoint') document.getElementById('step-revert').style.display='';
+        if(stage==='revert') document.getElementById('step-revert').style.display='none';
+        var next = {backup:'step-restore', restore:'step-repoint', repoint:'step-done'}[stage];
         if(next === 'step-done') document.getElementById('step-done').style.display='';
         if(next) setTimeout(function(){ goToStep(next); }, 400);
       } else if(d.error && d.needs_force){
@@ -1096,7 +1174,13 @@ function pollLog(){
   });
 }
 function setButtons(disabled){
-  ['btn-backup','btn-restore','btn-repoint'].forEach(id=>document.getElementById(id).disabled=disabled);
+  ['btn-backup','btn-restore','btn-repoint','btn-revert'].forEach(function(id){
+    var el=document.getElementById(id); if(el) el.disabled=disabled;
+  });
+}
+function revertMigration(){
+  if(!confirm('Point the console + Caddy back at the Old Authentik Machine?\\n\\nThe old machine is still running and untouched, so this is a safe rollback. Nothing is deleted on either machine.')) return;
+  runStep('revert');
 }
 function runBackup(){
   // Persist the Old Authentik Machine form before backing up, so it always
