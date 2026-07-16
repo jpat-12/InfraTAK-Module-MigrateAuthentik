@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.8.1'
+MODULE_VERSION = '1.9.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -125,6 +125,40 @@ def _diagnose_ssh_failure(out):
     if 'Host key verification failed' in out:
         return "Host key verification failed — the target's SSH host key changed (e.g. it was reinstalled). Remove the stale entry from this console's ~/.ssh/known_hosts for that IP and retry."
     return None
+
+
+def _install_ssh_key_via_password(cfg, host, one_time_password):
+    """ssh-copy-id equivalent: append this console's public key to the target's
+    authorized_keys, authenticating with a password supplied just for this call
+    (not necessarily the same as any password saved for ongoing use)."""
+    kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '~/.ssh/infra-tak-migrate-authentik-new')
+    pub = kp + '.pub'
+    if not os.path.exists(pub):
+        return False, 'Generate the SSH key first'
+    with open(pub) as f:
+        pubkey = f.read().strip()
+    if shutil.which('sshpass') is None:
+        return False, "sshpass isn't installed on this console — needed to install the key over password auth. Install it (e.g. `apt install sshpass`)."
+    user = (cfg.get('ssh_user') or 'root').strip() or 'root'
+    port = str(int(cfg.get('ssh_port') or 22))
+    remote_cmd = (
+        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+        f"grep -qxF '{pubkey}' ~/.ssh/authorized_keys 2>/dev/null || echo '{pubkey}' >> ~/.ssh/authorized_keys && "
+        "chmod 600 ~/.ssh/authorized_keys"
+    )
+    ssh_cmd = ['sshpass', '-e', 'ssh', '-o', 'StrictHostKeyChecking=accept-new', '-o', 'BatchMode=no',
+               '-p', port, f'{user}@{host}', remote_cmd]
+    env = os.environ.copy()
+    env['SSHPASS'] = one_time_password
+    try:
+        r = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30, env=env)
+    except Exception as e:
+        return False, str(e)
+    if r.returncode != 0:
+        out = ((r.stderr or '') + (r.stdout or '')).strip()
+        hint = _diagnose_ssh_failure(out)
+        return False, (hint or out or 'install failed')
+    return True, None
 
 
 def register_routes(app, login_required, load_settings, save_settings, ssh_probe, get_deploy_cfg):
@@ -224,6 +258,53 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             if hint:
                 out = f'{hint}\n\n(raw: {out})'
         return jsonify({'success': ok, 'output': out})
+
+    @app.route('/api/authentik/migrate/new-machine/ensure-ssh-key', methods=['POST'])
+    @login_required
+    def authentik_migrate_new_machine_ensure_ssh_key():
+        cfg = _new_machine_cfg()
+        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '~/.ssh/infra-tak-migrate-authentik-new')
+        pub = kp + '.pub'
+        if not os.path.exists(kp):
+            kdir = os.path.dirname(kp)
+            if kdir and not os.path.isdir(kdir):
+                os.makedirs(kdir, mode=0o700, exist_ok=True)
+            try:
+                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-migrate-authentik-new'],
+                               capture_output=True, text=True, timeout=30, check=True)
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'ssh-keygen failed: {e}'}), 500
+        fp = ''
+        try:
+            r = subprocess.run(['ssh-keygen', '-l', '-f', pub], capture_output=True, text=True, timeout=5)
+            fp = (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            pass
+        pk = ''
+        try:
+            with open(pub) as f:
+                pk = f.read().strip()
+        except Exception:
+            pass
+        new_machine = dict(cfg)
+        new_machine['ssh_key_path'] = kp
+        new_machine['auth_method'] = 'ssh_key'
+        _save_state(load_settings, save_settings, new_machine=new_machine)
+        return jsonify({'success': True, 'key_path': kp, 'public_key': pk, 'fingerprint': fp})
+
+    @app.route('/api/authentik/migrate/new-machine/install-ssh-key', methods=['POST'])
+    @login_required
+    def authentik_migrate_new_machine_install_ssh_key():
+        data = request.get_json() or {}
+        pwd = (data.get('password') or '').strip()
+        if not pwd:
+            return jsonify({'success': False, 'error': 'Password is required to install the key'}), 400
+        cfg = _new_machine_cfg()
+        host = (cfg.get('host') or '').strip()
+        if not host:
+            return jsonify({'success': False, 'error': 'New Authentik Machine host not configured'}), 400
+        ok, err = _install_ssh_key_via_password(cfg, host, pwd)
+        return jsonify({'success': ok, 'error': None if ok else err})
 
     # ------------------------------------------------------------------
     # Old Authentik Machine SSH credentials -- fixes authentik_deployment.remote
@@ -711,6 +792,10 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <button class="btn btn-ghost" onclick="saveNewMachine()">Save New Authentik Machine</button>
   <button class="btn btn-ghost" onclick="testNewMachineSsh()">Test SSH</button>
   <span id="ssh-status" class="status"></span>
+  <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have one yet? Generate a key here, then install it using the password once — after that you never need the password again.</div>
+  <button class="btn btn-ghost" type="button" onclick="generateNewMachineSshKey()">Generate SSH key</button>
+  <button class="btn btn-ghost" type="button" onclick="installNewMachineSshKey()">Install SSH key (uses password above, once)</button>
+  <textarea class="form-input" id="new-pubkey" readonly rows="2" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;resize:vertical" placeholder="Public key appears here after Generate"></textarea>
 </div>
 
 <div class="card" id="step-backup">
@@ -747,6 +832,10 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
       <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save</button>
       <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
       <span id="old-ssh-status" class="status"></span>
+      <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have one yet? Generate a key here, then install it using the password once — after that you never need the password again.</div>
+      <button class="btn btn-ghost" type="button" onclick="generateOldMachineSshKey()">Generate SSH key</button>
+      <button class="btn btn-ghost" type="button" onclick="installOldMachineSshKey()">Install SSH key (uses password above, once)</button>
+      <textarea class="form-input" id="old-pubkey" readonly rows="2" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;resize:vertical" placeholder="Public key appears here after Generate"></textarea>
     </div>
   </details>
   {% endif %}
@@ -825,6 +914,28 @@ function testNewMachineSsh(){
       if(d.success){ setTimeout(function(){ goToStep('step-backup'); }, 500); }
     });
 }
+function generateNewMachineSshKey(){
+  var st=document.getElementById('ssh-status'); st.textContent='generating key...'; st.className='status';
+  fetch('/api/authentik/migrate/new-machine/ensure-ssh-key',{method:'POST',credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      if(!d.success){ st.textContent=d.error||'key generation failed'; st.className='status err'; return; }
+      if(d.key_path) document.getElementById('new-key').value=d.key_path;
+      document.getElementById('new-auth').value='ssh_key';
+      document.getElementById('new-pubkey').value=d.public_key||'';
+      st.textContent='key ready'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
+    });
+}
+function installNewMachineSshKey(){
+  var pw=document.getElementById('new-pass').value;
+  if(!pw){ alert('Type the password in the field above first — used once to install the key, then you can switch auth to SSH key and never need it again.'); return; }
+  var st=document.getElementById('ssh-status'); st.textContent='installing key...'; st.className='status';
+  saveNewMachine();
+  fetch('/api/authentik/migrate/new-machine/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      st.textContent=d.success?'key installed — you can switch auth to SSH key now':(d.error||'install failed');
+      st.className='status '+(d.success?'ok':'err');
+    });
+}
 function collectOldMachineCreds(){
   return {
     ssh_user: document.getElementById('old-user').value.trim() || 'root',
@@ -847,6 +958,29 @@ function testOldMachineSsh(){
         st.className='status '+(d.success?'ok':'err');
       });
   });
+}
+function generateOldMachineSshKey(){
+  // Reuses infra-TAK's own Authentik-remote key endpoint -- "Old Authentik
+  // Machine" IS authentik_deployment.remote, so no need for a separate key.
+  var st=document.getElementById('old-ssh-status'); st.textContent='generating key...'; st.className='status';
+  fetch('/api/authentik/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      if(!d||!d.success){ st.textContent=(d&&d.error)||'key generation failed'; st.className='status err'; return; }
+      if(d.key_path) document.getElementById('old-key').value=d.key_path;
+      document.getElementById('old-auth').value='ssh_key';
+      document.getElementById('old-pubkey').value=d.public_key||'';
+      st.textContent='key ready'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
+    });
+}
+function installOldMachineSshKey(){
+  var pw=document.getElementById('old-pass').value;
+  if(!pw){ alert('Type the password in the field above first — used once to install the key, then you can switch auth to SSH key and never need it again.'); return; }
+  var st=document.getElementById('old-ssh-status'); st.textContent='installing key...'; st.className='status';
+  fetch('/api/authentik/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{
+      st.textContent=(d&&d.success)?'key installed — you can switch auth to SSH key now':((d&&d.error)||'install failed');
+      st.className='status '+((d&&d.success)?'ok':'err');
+    });
 }
 var pollTimer=null;
 var pollStage=null;
