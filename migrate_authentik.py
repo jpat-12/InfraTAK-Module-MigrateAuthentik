@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.7.0'
+MODULE_VERSION = '1.8.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -135,6 +135,16 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     def _new_machine_cfg():
         return _load_state(load_settings).get('new_machine', {}) or {}
 
+    def _old_machine_cfg():
+        """SSH config for wherever Authentik currently lives -- this is the console's
+        own authentik_deployment.remote, NOT anything this wizard's own forms save.
+        The backup step (and the console's Update Config & Reconnect, logs, etc.)
+        all authenticate through this, so it needs to be fixable from here too."""
+        ak_cfg = get_deploy_cfg(load_settings(), 'authentik_deployment')
+        if ak_cfg.get('target_mode') != 'remote':
+            return {}
+        return ak_cfg.get('remote', {}) or {}
+
     def _ssh_new_machine_ok(cfg):
         host = (cfg.get('host') or '').strip()
         return bool(host)
@@ -165,6 +175,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return render_template_string(
             MIGRATE_TEMPLATE,
             new_machine=state.get('new_machine', {}),
+            old_machine=_old_machine_cfg(),
             last_backup=state.get('last_backup'),
             chosen_ip=state.get('chosen_ip'),
             module_version=MODULE_VERSION,
@@ -205,6 +216,46 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         if not _ssh_new_machine_ok(cfg):
             return jsonify({'error': 'New Authentik Machine host not configured'}), 400
         preflight_error = _ssh_preflight(cfg, 'New Authentik Machine')
+        if preflight_error:
+            return jsonify({'success': False, 'output': preflight_error})
+        ok, out = ssh_probe(cfg, 'echo ok && uname -a', timeout=15)
+        if not ok:
+            hint = _diagnose_ssh_failure(out)
+            if hint:
+                out = f'{hint}\n\n(raw: {out})'
+        return jsonify({'success': ok, 'output': out})
+
+    # ------------------------------------------------------------------
+    # Old Authentik Machine SSH credentials -- fixes authentik_deployment.remote
+    # directly (host/target_mode stay untouched; those are owned by deploy/repoint).
+    # ------------------------------------------------------------------
+    @app.route('/api/authentik/migrate/old-machine/creds', methods=['POST'])
+    @login_required
+    def authentik_migrate_save_old_machine_creds():
+        data = request.get_json() or {}
+        settings2 = load_settings()
+        ak_cfg = settings2.get('authentik_deployment') or {}
+        if ak_cfg.get('target_mode') != 'remote':
+            return jsonify({'error': 'Old Authentik Machine is not configured as remote'}), 400
+        remote = ak_cfg.get('remote') or {}
+        submitted_password = data.get('ssh_password') or ''
+        remote['ssh_user'] = (data.get('ssh_user') or 'root').strip() or 'root'
+        remote['ssh_port'] = int(data.get('ssh_port') or 22)
+        remote['auth_method'] = (data.get('auth_method') or 'ssh_key').strip()
+        remote['ssh_key_path'] = (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip()
+        remote['ssh_password'] = submitted_password or remote.get('ssh_password', '')
+        ak_cfg['remote'] = remote
+        settings2['authentik_deployment'] = ak_cfg
+        save_settings(settings2)
+        return jsonify({'success': True})
+
+    @app.route('/api/authentik/migrate/old-machine/test-ssh', methods=['POST'])
+    @login_required
+    def authentik_migrate_test_old_machine_ssh():
+        cfg = _old_machine_cfg()
+        if not (cfg.get('host') or '').strip():
+            return jsonify({'error': 'Old Authentik Machine is not configured as remote'}), 400
+        preflight_error = _ssh_preflight(cfg, 'Old Authentik Machine')
         if preflight_error:
             return jsonify({'success': False, 'output': preflight_error})
         ok, out = ssh_probe(cfg, 'echo ok && uname -a', timeout=15)
@@ -664,6 +715,33 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
   <button class="btn btn-primary" id="btn-backup" onclick="runStep('backup')">Run backup</button>
   <a href="/api/authentik/migrate/backup/download"><button class="btn btn-ghost" {% if not last_backup %}disabled{% endif %}>Download tarball</button></a>
+  {% if old_machine.host %}
+  <details style="margin-top:14px">
+    <summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">SSH credentials for {{ old_machine.host }} — fix these if the backup step (or Update Config &amp; Reconnect / logs / control on the Authentik page) can't connect</summary>
+    <div style="margin-top:12px">
+      <div class="row">
+        <div>
+          <label class="form-label">SSH user</label>
+          <input class="form-input" id="old-user" value="{{ old_machine.ssh_user or 'root' }}">
+        </div>
+        <div>
+          <label class="form-label">SSH port</label>
+          <input class="form-input" id="old-port" value="{{ old_machine.ssh_port or 22 }}">
+        </div>
+      </div>
+      <label class="form-label">Auth</label>
+      <select class="form-input" id="old-auth">
+        <option value="ssh_key" {% if old_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
+        <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
+      </select>
+      <input class="form-input" id="old-key" placeholder="~/.ssh/id_ed25519" value="{{ old_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
+      <input class="form-input" id="old-pass" type="password" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+      <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save</button>
+      <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
+      <span id="old-ssh-status" class="status"></span>
+    </div>
+  </details>
+  {% endif %}
 </div>
 
 <div class="card" id="step-restore">
@@ -732,6 +810,29 @@ function testNewMachineSsh(){
       st.className='status '+(d.success?'ok':'err');
       if(d.success){ setTimeout(function(){ goToStep('step-backup'); }, 500); }
     });
+}
+function collectOldMachineCreds(){
+  return {
+    ssh_user: document.getElementById('old-user').value.trim() || 'root',
+    ssh_port: parseInt(document.getElementById('old-port').value) || 22,
+    auth_method: document.getElementById('old-auth').value,
+    ssh_key_path: document.getElementById('old-key').value.trim(),
+    ssh_password: document.getElementById('old-pass').value,
+  };
+}
+function saveOldMachineCreds(cb){
+  fetch('/api/authentik/migrate/old-machine/creds',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectOldMachineCreds()),credentials:'same-origin'})
+    .then(r=>r.json()).then(d=>{ if(cb) cb(d); });
+}
+function testOldMachineSsh(){
+  var st=document.getElementById('old-ssh-status'); st.textContent='testing...'; st.className='status';
+  saveOldMachineCreds(function(){
+    fetch('/api/authentik/migrate/old-machine/test-ssh',{method:'POST',credentials:'same-origin'})
+      .then(r=>r.json()).then(d=>{
+        st.textContent=d.success?'reachable':('failed: '+(d.output||d.error||''));
+        st.className='status '+(d.success?'ok':'err');
+      });
+  });
 }
 var pollTimer=null;
 var pollStage=null;
