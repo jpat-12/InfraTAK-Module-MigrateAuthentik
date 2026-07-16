@@ -49,6 +49,9 @@ MIGRATE_STATE = {'running': False, 'stage': None, 'complete': False, 'error': Fa
 SELF_UPDATE_LOG = []
 SELF_UPDATE_STATE = {'running': False, 'complete': False, 'error': False, 'restarted': False}
 
+UNINSTALL_LOG = []
+UNINSTALL_STATE = {'running': False, 'complete': False, 'error': False, 'restarted': False}
+
 
 def _mlog(msg):
     MIGRATE_LOG.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
@@ -56,6 +59,10 @@ def _mlog(msg):
 
 def _sulog(msg):
     SELF_UPDATE_LOG.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
+
+
+def _uilog(msg):
+    UNINSTALL_LOG.append(f'[{time.strftime("%H:%M:%S")}] {msg}')
 
 
 def _load_state(load_settings):
@@ -379,6 +386,49 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'error': SELF_UPDATE_STATE['error'], 'restarted': SELF_UPDATE_STATE['restarted'],
         })
 
+    # ------------------------------------------------------------------
+    # Uninstall — removes this module's registration + button from app.py,
+    # deletes migrate_authentik.py, restarts the console. Leaves
+    # scripts/authentik-migrate/*.sh alone (infra-TAK's own toolkit).
+    # ------------------------------------------------------------------
+    def _run_uninstall():
+        UNINSTALL_STATE.update({'running': True, 'complete': False, 'error': False, 'restarted': False})
+        UNINSTALL_LOG.clear()
+        try:
+            uninstall_sh = os.path.join(MODULE_CHECKOUT_DIR, 'uninstall.sh')
+            if not os.path.exists(uninstall_sh):
+                _uilog(f'ERROR: module checkout not found at {MODULE_CHECKOUT_DIR}.')
+                UNINSTALL_STATE.update({'running': False, 'error': True})
+                return
+            _uilog('Removing module registration + button from app.py...')
+            ok, out = _run_local(f'bash "{uninstall_sh}"', timeout=60)
+            _uilog(out)
+            UNINSTALL_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'restarted': ok})
+        except Exception as e:
+            _uilog(f'ERROR: {e}')
+            UNINSTALL_STATE.update({'running': False, 'error': True})
+
+    @app.route('/api/authentik/migrate/uninstall', methods=['POST'])
+    @login_required
+    def authentik_migrate_uninstall():
+        if UNINSTALL_STATE.get('running'):
+            return jsonify({'error': 'Uninstall already in progress'}), 409
+        # Console restarts mid-uninstall (this route's own module gets
+        # unregistered) — respond immediately, UI polls the log until the
+        # connection drops.
+        threading.Thread(target=_run_uninstall, daemon=True).start()
+        return jsonify({'success': True})
+
+    @app.route('/api/authentik/migrate/uninstall/log')
+    @login_required
+    def authentik_migrate_uninstall_log():
+        idx = request.args.get('index', 0, type=int)
+        return jsonify({
+            'entries': UNINSTALL_LOG[idx:], 'total': len(UNINSTALL_LOG),
+            'running': UNINSTALL_STATE['running'], 'complete': UNINSTALL_STATE['complete'],
+            'error': UNINSTALL_STATE['error'], 'restarted': UNINSTALL_STATE['restarted'],
+        })
+
 
 MIGRATE_TEMPLATE = '''<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
@@ -404,6 +454,7 @@ pre#log{background:#05070c;border:1px solid var(--border);border-radius:8px;padd
 .status{font-size:12px;font-weight:600;margin-left:10px}
 .status.ok{color:var(--green)}.status.err{color:var(--red)}
 a.back{color:var(--cyan);text-decoration:none;font-size:12px}
+.btn-danger{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
 </style></head>
 <body>
 <a class="back" href="/authentik">&larr; Back to Authentik</a>
@@ -472,6 +523,14 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <pre id="su-log" style="margin-top:10px;display:none"></pre>
 </div>
 
+<div class="card">
+  <div class="card-title">Remove module</div>
+  <div class="hint">Removes the Migrate button and this wizard from the console (restarts the console service). Does not touch scripts/authentik-migrate — that's infra-TAK's own toolkit — and does not undo any migration you already ran.</div>
+  <button class="btn btn-danger" id="btn-uninstall" onclick="uninstallModule()">Uninstall module</button>
+  <span id="ui-status" class="status"></span>
+  <pre id="ui-log" style="margin-top:10px;display:none"></pre>
+</div>
+
 <script>
 function collectTarget(){
   return {
@@ -538,6 +597,29 @@ function selfUpdate(){
         }
       }).catch(function(){
         // console process restarting — expected mid-update
+        st.textContent='console restarting...';
+      });
+    }, 1500);
+  });
+}
+function uninstallModule(){
+  if(!confirm('Remove the Migrate Authentik module from this console? This restarts the console service. Your migration scripts and any backups already taken are left in place.')) return;
+  var st=document.getElementById('ui-status'); st.textContent='uninstalling...'; st.className='status';
+  var log=document.getElementById('ui-log'); log.style.display='block';
+  document.getElementById('btn-uninstall').disabled=true;
+  fetch('/api/authentik/migrate/uninstall',{method:'POST',credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    if(d.error){ st.textContent=d.error; st.className='status err'; document.getElementById('btn-uninstall').disabled=false; return; }
+    var t=setInterval(function(){
+      fetch('/api/authentik/migrate/uninstall/log?index=0',{credentials:'same-origin'}).then(r=>r.json()).then(function(dd){
+        log.textContent = dd.entries.join('\\n');
+        if(!dd.running){
+          clearInterval(t);
+          st.textContent = dd.error ? 'failed' : 'removed — console restarted, redirecting...';
+          st.className='status '+(dd.error?'err':'ok');
+          if(!dd.error){ setTimeout(function(){ window.location.href='/authentik'; }, 4000); }
+          else { document.getElementById('btn-uninstall').disabled=false; }
+        }
+      }).catch(function(){
         st.textContent='console restarting...';
       });
     }, 1500);
