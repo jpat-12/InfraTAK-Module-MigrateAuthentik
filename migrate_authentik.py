@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.5.0'
+MODULE_VERSION = '1.6.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -333,9 +333,32 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             _mlog(f'Pointing console + Caddy at {new_ip}:9090...')
             ok, out = _run_local(f'bash "{repoint_script}" {new_ip}', timeout=60)
             _mlog(out)
-            MIGRATE_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'stage': 'repoint'})
             if ok:
                 _save_state(load_settings, save_settings, chosen_ip=new_ip)
+                # authentik-repoint-caddy.sh only ever sets host/target_mode — it
+                # deliberately doesn't touch SSH credentials. Without them, every
+                # other console feature that needs remote SSH access (Update
+                # Config & Reconnect, logs, control, container stats, ...) fails
+                # silently. Carry over the credentials this wizard already knows
+                # work, onto the console's own authentik_deployment.remote.
+                new_cfg = _new_machine_cfg()
+                if new_cfg.get('host'):
+                    settings2 = load_settings()
+                    ak_cfg = settings2.get('authentik_deployment') or {}
+                    if ak_cfg.get('target_mode') == 'remote':
+                        remote = ak_cfg.get('remote') or {}
+                        remote['ssh_user'] = new_cfg.get('ssh_user', 'root')
+                        remote['ssh_port'] = new_cfg.get('ssh_port', 22)
+                        remote['auth_method'] = new_cfg.get('auth_method', 'ssh_key')
+                        remote['ssh_key_path'] = new_cfg.get('ssh_key_path', '')
+                        remote['ssh_password'] = new_cfg.get('ssh_password', '')
+                        ak_cfg['remote'] = remote
+                        settings2['authentik_deployment'] = ak_cfg
+                        save_settings(settings2)
+                        _mlog("Copied the New Authentik Machine's SSH credentials into the console's "
+                              "Authentik deployment target, so Update Config & Reconnect / logs / "
+                              "control work without re-entering them.")
+            MIGRATE_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'stage': 'repoint'})
         except Exception as e:
             _mlog(f'ERROR: {e}')
             MIGRATE_STATE.update({'running': False, 'error': True})
@@ -582,7 +605,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 
 <div class="card" id="step-done" style="display:none">
   <div class="card-title">Done</div>
-  <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine. Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
+  <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine (its SSH credentials were also copied onto the console's Authentik deployment target, so remote features keep working). Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
 </div>
 
 <script>
