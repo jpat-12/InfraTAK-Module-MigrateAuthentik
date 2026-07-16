@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.8.0'
+MODULE_VERSION = '1.8.1'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -703,7 +703,11 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
     <option value="password" {% if new_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
   <input class="form-input" id="new-key" placeholder="~/.ssh/id_ed25519" value="{{ new_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
-  <input class="form-input" id="new-pass" type="password" placeholder="{% if new_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+  <div style="display:flex;gap:8px;align-items:center">
+    <input class="form-input" id="new-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if new_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+    <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('new-pass', this)">show</button>
+  </div>
+  <div style="margin-bottom:12px"></div>
   <button class="btn btn-ghost" onclick="saveNewMachine()">Save New Authentik Machine</button>
   <button class="btn btn-ghost" onclick="testNewMachineSsh()">Test SSH</button>
   <span id="ssh-status" class="status"></span>
@@ -735,7 +739,11 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
         <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
       </select>
       <input class="form-input" id="old-key" placeholder="~/.ssh/id_ed25519" value="{{ old_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
-      <input class="form-input" id="old-pass" type="password" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+      <div style="display:flex;gap:8px;align-items:center">
+        <input class="form-input" id="old-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+        <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('old-pass', this)">show</button>
+      </div>
+      <div style="margin-bottom:12px"></div>
       <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save</button>
       <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
       <span id="old-ssh-status" class="status"></span>
@@ -768,6 +776,12 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </div>
 
 <script>
+function toggleShowPassword(id, btn){
+  var el=document.getElementById(id);
+  var showing = el.type==='text';
+  el.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? 'show' : 'hide';
+}
 function toggleSettings(evt){
   if(evt) evt.stopPropagation();
   document.getElementById('settings-panel').classList.toggle('open');
