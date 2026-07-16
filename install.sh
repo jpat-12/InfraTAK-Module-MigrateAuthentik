@@ -119,11 +119,23 @@ with open(path, 'w', encoding='utf-8') as f:
     f.write(src)
 PYEOF
 
-# --- 5. Restart the console service --------------------------------------
-if systemctl restart "$CONSOLE_SERVICE" 2>/dev/null; then
-    echo "==> Restarted $CONSOLE_SERVICE"
+# --- 5. Restart the console service ---------------------------------------
+# Restarting takwerx-console the direct way (`systemctl restart` run as a
+# child of this script) kills this whole process tree first, since it lives
+# in the same cgroup as the console — including this script and whatever
+# invoked it (e.g. the console's own self-update route running install.sh
+# as a subprocess). That cuts the script off mid-run before it can print
+# anything past this point, or report success back to whatever called it.
+# systemd-run --no-block launches the restart as its own transient unit,
+# outside that cgroup, so it survives the console dying and this script gets
+# to finish normally; the actual restart happens a moment later.
+if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --no-block --collect --quiet -- systemctl restart "$CONSOLE_SERVICE" 2>/dev/null \
+        && echo "==> Restart of $CONSOLE_SERVICE scheduled (applies within a few seconds)" \
+        || echo "    ⚠ Could not schedule restart of $CONSOLE_SERVICE — restart it manually" >&2
 else
-    echo "    ⚠ Could not restart $CONSOLE_SERVICE via systemctl — restart it manually" >&2
+    (systemctl restart "$CONSOLE_SERVICE" 2>/dev/null &)
+    echo "==> Restart of $CONSOLE_SERVICE requested (systemd-run unavailable, backgrounded instead)"
 fi
 
 echo ""

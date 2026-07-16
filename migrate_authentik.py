@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.2.0'
+MODULE_VERSION = '1.3.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -377,10 +377,13 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             )
             new_version = new_version_out.strip() if ok_v else '?'
             _sulog(f'Synced version: v{new_version}' + (' (unchanged)' if new_version == MODULE_VERSION else ' (updated)'))
-            _sulog(f'Restarting {CONSOLE_SERVICE} to load any route/UI changes...')
-            ok2, out2 = _run_local(f'systemctl restart {CONSOLE_SERVICE}', timeout=30)
-            _sulog(out2 or ('ok' if ok2 else 'restart command failed'))
-            SELF_UPDATE_STATE.update({'running': False, 'complete': True, 'restarted': ok2})
+            # install.sh already scheduled the console restart itself (detached via
+            # systemd-run, see install.sh) — don't restart again here. A second,
+            # direct `systemctl restart` from this process would kill this very
+            # thread before it could report back, the same bug install.sh's own
+            # restart used to have.
+            _sulog(f'{CONSOLE_SERVICE} restart was scheduled by install.sh — applies within a few seconds.')
+            SELF_UPDATE_STATE.update({'running': False, 'complete': True, 'restarted': True})
         except Exception as e:
             _sulog(f'ERROR: {e}')
             SELF_UPDATE_STATE.update({'running': False, 'error': True})

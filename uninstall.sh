@@ -80,10 +80,17 @@ else
     echo "    = migrate_authentik.py not present, nothing to delete"
 fi
 
-if systemctl restart "$CONSOLE_SERVICE" 2>/dev/null; then
-    echo "==> Restarted $CONSOLE_SERVICE"
+# See install.sh for why this uses systemd-run --no-block rather than a
+# direct `systemctl restart`: a direct restart kills this whole process tree
+# (including whatever invoked this script, e.g. the console's own in-app
+# uninstall route) before it can finish or report back.
+if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --no-block --collect --quiet -- systemctl restart "$CONSOLE_SERVICE" 2>/dev/null \
+        && echo "==> Restart of $CONSOLE_SERVICE scheduled (applies within a few seconds)" \
+        || echo "    ⚠ Could not schedule restart of $CONSOLE_SERVICE — restart it manually" >&2
 else
-    echo "    ⚠ Could not restart $CONSOLE_SERVICE via systemctl — restart it manually" >&2
+    (systemctl restart "$CONSOLE_SERVICE" 2>/dev/null &)
+    echo "==> Restart of $CONSOLE_SERVICE requested (systemd-run unavailable, backgrounded instead)"
 fi
 
 echo ""
