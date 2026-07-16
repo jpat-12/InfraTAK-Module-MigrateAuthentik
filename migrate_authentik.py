@@ -25,6 +25,7 @@ Call register_routes(app, login_required, load_settings, save_settings,
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -32,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.6.1'
+MODULE_VERSION = '1.7.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -88,6 +89,42 @@ def _save_state(load_settings, save_settings, **updates):
 def _run_local(cmd, timeout=120):
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
     return r.returncode == 0, ((r.stdout or '') + (r.stderr or ''))
+
+
+def _ssh_preflight(cfg, label):
+    """Catch known-broken SSH configs before ever touching the network, so
+    failures read as a clear cause instead of a generic 'Permission denied'.
+    Returns an error string, or None if the config looks usable."""
+    if (cfg.get('auth_method') or 'ssh_key') == 'password':
+        if not (cfg.get('ssh_password') or '').strip():
+            return (f"{label} is set to password auth but no password is saved (page reloads clear the "
+                    f"password field — it never re-fills). Re-enter it and save, then try again.")
+        if shutil.which('sshpass') is None:
+            return (f"{label} uses password auth, but 'sshpass' isn't installed on this console — "
+                    f"password auth can't work without it. Install it (e.g. `apt install sshpass` or "
+                    f"`dnf install sshpass`) or switch {label} to SSH key auth.")
+    else:
+        key_path = (cfg.get('ssh_key_path') or '').strip()
+        if key_path and not os.path.exists(os.path.expanduser(key_path)):
+            return f"{label} is set to use SSH key '{key_path}', but that file doesn't exist on this console."
+    return None
+
+
+def _diagnose_ssh_failure(out):
+    """Turn a raw failed SSH/SCP transcript into an actionable one-line hint."""
+    out = out or ''
+    if 'Permission denied' in out and ('publickey' in out or 'password' in out):
+        return ("SSH authentication was rejected by the target (tried key and/or password). Likely causes: "
+                "the saved password is wrong or was blanked by a page reload (re-enter it in step 1), the "
+                "SSH key isn't authorized on that machine (check ~/.ssh/authorized_keys there), or the "
+                "account/user is wrong.")
+    if 'Could not resolve hostname' in out:
+        return "Could not resolve that hostname — check the host/IP in step 1."
+    if 'No route to host' in out or 'Connection timed out' in out or 'Connection refused' in out:
+        return "Could not reach the host on that port — check the IP, port, and that a firewall isn't blocking it."
+    if 'Host key verification failed' in out:
+        return "Host key verification failed — the target's SSH host key changed (e.g. it was reinstalled). Remove the stale entry from this console's ~/.ssh/known_hosts for that IP and retry."
+    return None
 
 
 def register_routes(app, login_required, load_settings, save_settings, ssh_probe, get_deploy_cfg):
@@ -167,7 +204,14 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         cfg = _new_machine_cfg()
         if not _ssh_new_machine_ok(cfg):
             return jsonify({'error': 'New Authentik Machine host not configured'}), 400
+        preflight_error = _ssh_preflight(cfg, 'New Authentik Machine')
+        if preflight_error:
+            return jsonify({'success': False, 'output': preflight_error})
         ok, out = ssh_probe(cfg, 'echo ok && uname -a', timeout=15)
+        if not ok:
+            hint = _diagnose_ssh_failure(out)
+            if hint:
+                out = f'{hint}\n\n(raw: {out})'
         return jsonify({'success': ok, 'output': out})
 
     # ------------------------------------------------------------------
@@ -182,16 +226,27 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             backup_script = os.path.join(SCRIPTS_DIR, 'authentik-backup.sh')
             if current_cfg.get('target_mode') == 'remote' and (current_cfg.get('remote', {}).get('host') or '').strip():
                 current = current_cfg['remote']
+                preflight_error = _ssh_preflight(current, 'Old Authentik Machine')
+                if preflight_error:
+                    _mlog(f'ERROR: {preflight_error}')
+                    MIGRATE_STATE.update({'running': False, 'error': True})
+                    return
                 _mlog(f"Old Authentik Machine is remote ({current.get('host')}) — copying backup script over...")
                 ok, out = _scp_to_new_machine(current, backup_script, '/root/authentik-backup.sh')
                 if not ok:
+                    hint = _diagnose_ssh_failure(out)
                     _mlog(f'ERROR: could not copy backup script to Old Authentik Machine: {out}')
+                    if hint:
+                        _mlog(f'HINT: {hint}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
                 _mlog('Running backup on the Old Authentik Machine (pg_dump, no downtime)...')
                 ok, out = ssh_probe(current, 'bash /root/authentik-backup.sh /root', timeout=600)
                 _mlog(out)
                 if not ok:
+                    hint = _diagnose_ssh_failure(out)
+                    if hint:
+                        _mlog(f'HINT: {hint}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
                 m = re.search(r'Backup complete: (\S+\.tar\.gz)', out)
@@ -269,6 +324,11 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 _mlog('ERROR: New Authentik Machine not configured — fill in step 1 first')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
+            preflight_error = _ssh_preflight(cfg, 'New Authentik Machine')
+            if preflight_error:
+                _mlog(f'ERROR: {preflight_error}')
+                MIGRATE_STATE.update({'running': False, 'error': True})
+                return
             state = _load_state(load_settings)
             tarball = (state.get('last_backup') or {}).get('path')
             if not tarball or not os.path.exists(tarball):
@@ -280,12 +340,18 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             _mlog(f'Copying backup + restore script to {cfg["host"]}...')
             ok, out = _scp_to_new_machine(cfg, tarball, remote_tarball)
             if not ok:
+                hint = _diagnose_ssh_failure(out)
                 _mlog(f'ERROR copying tarball: {out}')
+                if hint:
+                    _mlog(f'HINT: {hint}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             ok, out = _scp_to_new_machine(cfg, restore_script, '/root/authentik-restore.sh')
             if not ok:
+                hint = _diagnose_ssh_failure(out)
                 _mlog(f'ERROR copying restore script: {out}')
+                if hint:
+                    _mlog(f'HINT: {hint}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             force_flag = ' --force' if force else ''
@@ -299,6 +365,9 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                     _mlog('Authentik is already installed on the New Authentik Machine. Re-run with --force to overwrite it (this deletes its current database volumes — not your backup).')
                     MIGRATE_STATE.update({'running': False, 'error': True, 'needs_force': True})
                 else:
+                    hint = _diagnose_ssh_failure(out)
+                    if hint:
+                        _mlog(f'HINT: {hint}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             ips = re.findall(r'^\s*\d+\)\s+([0-9.]+)', out, re.MULTILINE)
