@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.10.0'
+MODULE_VERSION = '1.10.1'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -279,7 +279,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
             'ssh_port': int(data.get('ssh_port') or 22),
             'auth_method': (data.get('auth_method') or 'ssh_key').strip(),
-            'ssh_key_path': (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip(),
+            'ssh_key_path': (data.get('ssh_key_path') or '/root/.ssh/infra-tak-authentik-new').strip(),
             'ssh_password': submitted_password or _new_machine_cfg().get('ssh_password', ''),
         }
         _save_state(load_settings, save_settings, new_machine=new_machine)
@@ -364,7 +364,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
             'ssh_port': int(data.get('ssh_port') or 22),
             'auth_method': (data.get('auth_method') or 'ssh_key').strip(),
-            'ssh_key_path': (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip(),
+            'ssh_key_path': (data.get('ssh_key_path') or '/root/.ssh/infra-tak-authentik-migrate').strip(),
             # Browsers never re-fill a password field after reload, so a blank
             # submission means "unchanged", not "clear it".
             'ssh_password': submitted_password or (_load_state(load_settings).get('old_machine') or {}).get('ssh_password', ''),
@@ -865,7 +865,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
     <option value="ssh_key" {% if new_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
     <option value="password" {% if new_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
-  <input class="form-input" id="new-key" placeholder="~/.ssh/id_ed25519" value="{{ new_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
+  <input class="form-input" id="new-key" placeholder="/root/.ssh/infra-tak-authentik-new" value="{{ new_machine.ssh_key_path or '/root/.ssh/infra-tak-authentik-new' }}">
   <div style="display:flex;gap:8px;align-items:center">
     <input class="form-input" id="new-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if new_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
     <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('new-pass', this)">show</button>
@@ -902,7 +902,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
     <option value="ssh_key" {% if old_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
     <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
   </select>
-  <input class="form-input" id="old-key" placeholder="~/.ssh/id_ed25519" value="{{ old_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
+  <input class="form-input" id="old-key" placeholder="/root/.ssh/infra-tak-authentik-migrate" value="{{ old_machine.ssh_key_path or '/root/.ssh/infra-tak-authentik-migrate' }}">
   <div style="display:flex;gap:8px;align-items:center">
     <input class="form-input" id="old-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
     <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('old-pass', this)">show</button>
