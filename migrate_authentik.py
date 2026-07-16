@@ -32,7 +32,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.1.0'
+MODULE_VERSION = '1.2.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -474,13 +474,15 @@ pre#log{background:#05070c;border:1px solid var(--border);border-radius:8px;padd
 .status.ok{color:var(--green)}.status.err{color:var(--red)}
 a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 .btn-danger{background:rgba(239,68,68,.12);color:var(--red);border-color:rgba(239,68,68,.3)}
+.card{transition:box-shadow .4s,border-color .4s}
+.card.flash{box-shadow:0 0 0 2px var(--accent);border-color:var(--accent)}
 </style></head>
 <body>
 <a class="back" href="/authentik">&larr; Back to Authentik</a>
 <h1>Migrate Authentik to a New Authentik Machine <span style="font-size:11px;font-weight:400;color:var(--text-dim);font-family:'JetBrains Mono',monospace">v{{ module_version }}</span></h1>
 <div class="sub">Backs up Authentik from the Old Authentik Machine (detected automatically — no input needed), restores it on the New Authentik Machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the old machine destructively.</div>
 
-<div class="card">
+<div class="card" id="step-new-machine">
   <div class="card-title">1 &middot; New Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine you're moving Authentik TO)</span></div>
   <div class="row">
     <div style="flex:2">
@@ -508,7 +510,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <span id="ssh-status" class="status"></span>
 </div>
 
-<div class="card">
+<div class="card" id="step-backup">
   <div class="card-title">2 &middot; Back Up Old Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(wherever Authentik runs today)</span></div>
   <div class="hint">Auto-detected from infra-TAK's existing Authentik deployment config (local or remote) — nothing to fill in here. Live pg_dump, no downtime.</div>
   {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
@@ -516,22 +518,27 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   <a href="/api/authentik/migrate/backup/download"><button class="btn btn-ghost" {% if not last_backup %}disabled{% endif %}>Download tarball</button></a>
 </div>
 
-<div class="card">
+<div class="card" id="step-restore">
   <div class="card-title">3 &middot; Restore on New Authentik Machine</div>
   <div class="hint">Copies the backup + installs Docker if needed, restores the DB before Authentik ever boots against it, brings the stack up. Uses the New Authentik Machine from step 1.</div>
   <button class="btn btn-primary" id="btn-restore" onclick="runStep('restore')">Copy + Restore on New Authentik Machine</button>
 </div>
 
-<div class="card">
+<div class="card" id="step-repoint">
   <div class="card-title">4 &middot; Point Console + Caddy at New Authentik Machine</div>
   <div class="hint">Runs locally on this console. Enter the IP the restore step reported (or 127.0.0.1 if the New Authentik Machine IS this console).</div>
   <input class="form-input" id="caddy-ip" placeholder="New Authentik IP" value="{{ chosen_ip or '' }}">
   <button class="btn btn-primary" id="btn-repoint" onclick="runRepoint()">Point console + Caddy now</button>
 </div>
 
-<div class="card">
+<div class="card" id="step-log">
   <div class="card-title">Live log</div>
   <pre id="log">(idle)</pre>
+</div>
+
+<div class="card" id="step-done" style="display:none">
+  <div class="card-title">Done</div>
+  <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine. Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
 </div>
 
 <div class="card">
@@ -561,6 +568,13 @@ function collectNewMachine(){
     ssh_password: document.getElementById('new-pass').value,
   };
 }
+function goToStep(id){
+  var el=document.getElementById(id);
+  if(!el) return;
+  el.scrollIntoView({behavior:'smooth', block:'start'});
+  el.classList.add('flash');
+  setTimeout(function(){ el.classList.remove('flash'); }, 1600);
+}
 function saveNewMachine(){
   fetch('/api/authentik/migrate/new-machine',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectNewMachine()),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{document.getElementById('ssh-status').textContent=d.success?'saved':'error';});
@@ -569,14 +583,28 @@ function testNewMachineSsh(){
   var st=document.getElementById('ssh-status'); st.textContent='testing...'; st.className='status';
   saveNewMachine();
   fetch('/api/authentik/migrate/new-machine/test-ssh',{method:'POST',credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{ st.textContent=d.success?'reachable':('failed: '+(d.output||d.error||'')); st.className='status '+(d.success?'ok':'err'); });
+    .then(r=>r.json()).then(d=>{
+      st.textContent=d.success?'reachable':('failed: '+(d.output||d.error||''));
+      st.className='status '+(d.success?'ok':'err');
+      if(d.success){ setTimeout(function(){ goToStep('step-backup'); }, 500); }
+    });
 }
 var pollTimer=null;
+var pollStage=null;
 function pollLog(){
   fetch('/api/authentik/migrate/log?index=0',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
     document.getElementById('log').textContent = d.entries.length ? d.entries.join('\\n') : '(idle)';
     document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
-    if(!d.running){ clearInterval(pollTimer); setButtons(false); }
+    if(!d.running){
+      clearInterval(pollTimer); setButtons(false);
+      if(!d.error && d.complete){
+        var next = {backup:'step-restore', restore:'step-repoint', repoint:'step-done'}[d.stage || pollStage];
+        if(next === 'step-done') document.getElementById('step-done').style.display='';
+        if(next) setTimeout(function(){ goToStep(next); }, 400);
+      } else if(d.error){
+        setTimeout(function(){ goToStep('step-log'); }, 300);
+      }
+    }
   });
 }
 function setButtons(disabled){
@@ -584,17 +612,21 @@ function setButtons(disabled){
 }
 function runStep(step){
   setButtons(true);
+  pollStage=step;
   fetch('/api/authentik/migrate/'+step,{method:'POST',credentials:'same-origin'}).then(r=>r.json()).then(d=>{
     if(d.error){ alert(d.error); setButtons(false); return; }
+    goToStep('step-log');
     pollTimer=setInterval(pollLog,1500); pollLog();
   });
 }
 function runRepoint(){
   setButtons(true);
+  pollStage='repoint';
   var ip=document.getElementById('caddy-ip').value.trim();
   fetch('/api/authentik/migrate/repoint',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ip:ip}),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{
       if(d.error){ alert(d.error); setButtons(false); return; }
+      goToStep('step-log');
       pollTimer=setInterval(pollLog,1500); pollLog();
     });
 }
