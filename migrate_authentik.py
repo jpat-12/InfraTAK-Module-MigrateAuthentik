@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.9.4'
+MODULE_VERSION = '1.10.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -214,15 +214,25 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     def _new_machine_cfg():
         return _load_state(load_settings).get('new_machine', {}) or {}
 
-    def _old_machine_cfg():
-        """SSH config for wherever Authentik currently lives -- this is the console's
-        own authentik_deployment.remote, NOT anything this wizard's own forms save.
-        The backup step (and the console's Update Config & Reconnect, logs, etc.)
-        all authenticate through this, so it needs to be fixable from here too."""
+    def _old_machine_autodetect():
+        """Best guess for where Authentik lives today, from the console's own
+        authentik_deployment.remote -- used only to pre-fill the Old Authentik
+        Machine form the first time, before the operator has entered anything."""
         ak_cfg = get_deploy_cfg(load_settings(), 'authentik_deployment')
         if ak_cfg.get('target_mode') != 'remote':
             return {}
         return ak_cfg.get('remote', {}) or {}
+
+    def _old_machine_cfg():
+        """SSH config for the Old Authentik Machine (backup source). An explicit
+        host entered in this wizard's own form always wins -- that is what keeps
+        the source (Server2) from silently collapsing onto whatever the console's
+        deployment config happens to point at. Falls back to autodetect only when
+        the operator hasn't set a host here yet."""
+        m = _load_state(load_settings).get('old_machine') or {}
+        if (m.get('host') or '').strip():
+            return m
+        return _old_machine_autodetect()
 
     def _ssh_new_machine_ok(cfg):
         host = (cfg.get('host') or '').strip()
@@ -339,28 +349,75 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return jsonify({'success': ok, 'error': None if ok else err})
 
     # ------------------------------------------------------------------
-    # Old Authentik Machine SSH credentials -- fixes authentik_deployment.remote
-    # directly (host/target_mode stay untouched; those are owned by deploy/repoint).
+    # Old Authentik Machine (backup source, Server2) -- a full, explicit SSH
+    # config owned by this wizard, symmetric with the New Authentik Machine.
+    # Decoupled from authentik_deployment.remote on purpose: the source must be
+    # stated outright so it can never silently collapse onto the destination.
     # ------------------------------------------------------------------
     @app.route('/api/authentik/migrate/old-machine/creds', methods=['POST'])
     @login_required
     def authentik_migrate_save_old_machine_creds():
         data = request.get_json() or {}
-        settings2 = load_settings()
-        ak_cfg = settings2.get('authentik_deployment') or {}
-        if ak_cfg.get('target_mode') != 'remote':
-            return jsonify({'error': 'Old Authentik Machine is not configured as remote'}), 400
-        remote = ak_cfg.get('remote') or {}
         submitted_password = data.get('ssh_password') or ''
-        remote['ssh_user'] = (data.get('ssh_user') or 'root').strip() or 'root'
-        remote['ssh_port'] = int(data.get('ssh_port') or 22)
-        remote['auth_method'] = (data.get('auth_method') or 'ssh_key').strip()
-        remote['ssh_key_path'] = (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip()
-        remote['ssh_password'] = submitted_password or remote.get('ssh_password', '')
-        ak_cfg['remote'] = remote
-        settings2['authentik_deployment'] = ak_cfg
-        save_settings(settings2)
-        return jsonify({'success': True})
+        old_machine = {
+            'host': (data.get('host') or '').strip(),
+            'ssh_user': (data.get('ssh_user') or 'root').strip() or 'root',
+            'ssh_port': int(data.get('ssh_port') or 22),
+            'auth_method': (data.get('auth_method') or 'ssh_key').strip(),
+            'ssh_key_path': (data.get('ssh_key_path') or '~/.ssh/id_ed25519').strip(),
+            # Browsers never re-fill a password field after reload, so a blank
+            # submission means "unchanged", not "clear it".
+            'ssh_password': submitted_password or (_load_state(load_settings).get('old_machine') or {}).get('ssh_password', ''),
+        }
+        _save_state(load_settings, save_settings, old_machine=old_machine)
+        return jsonify({'success': True, 'password_kept': bool(not submitted_password and old_machine['ssh_password'])})
+
+    @app.route('/api/authentik/migrate/old-machine/ensure-ssh-key', methods=['POST'])
+    @login_required
+    def authentik_migrate_old_machine_ensure_ssh_key():
+        cfg = _old_machine_cfg()
+        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '/root/.ssh/infra-tak-authentik-migrate')
+        pub = kp + '.pub'
+        if not os.path.exists(kp):
+            kdir = os.path.dirname(kp)
+            if kdir and not os.path.isdir(kdir):
+                os.makedirs(kdir, mode=0o700, exist_ok=True)
+            try:
+                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-authentik-migrate'],
+                               capture_output=True, text=True, timeout=30, check=True)
+            except Exception as e:
+                return jsonify({'success': False, 'error': f'ssh-keygen failed: {e}'}), 500
+        fp = ''
+        try:
+            r = subprocess.run(['ssh-keygen', '-l', '-f', pub], capture_output=True, text=True, timeout=5)
+            fp = (r.stdout or '').strip() if r.returncode == 0 else ''
+        except Exception:
+            pass
+        pk = ''
+        try:
+            with open(pub) as f:
+                pk = f.read().strip()
+        except Exception:
+            pass
+        old_machine = dict(_load_state(load_settings).get('old_machine') or cfg)
+        old_machine['ssh_key_path'] = kp
+        old_machine['auth_method'] = 'ssh_key'
+        _save_state(load_settings, save_settings, old_machine=old_machine)
+        return jsonify({'success': True, 'key_path': kp, 'public_key': pk, 'fingerprint': fp})
+
+    @app.route('/api/authentik/migrate/old-machine/install-ssh-key', methods=['POST'])
+    @login_required
+    def authentik_migrate_old_machine_install_ssh_key():
+        data = request.get_json() or {}
+        pwd = (data.get('password') or '').strip()
+        if not pwd:
+            return jsonify({'success': False, 'error': 'Password is required to install the key'}), 400
+        cfg = _old_machine_cfg()
+        host = (cfg.get('host') or '').strip()
+        if not host:
+            return jsonify({'success': False, 'error': 'Old Authentik Machine host not configured'}), 400
+        ok, err = _install_ssh_key_via_password(cfg, host, pwd)
+        return jsonify({'success': ok, 'error': None if ok else err})
 
     @app.route('/api/authentik/migrate/old-machine/test-ssh', methods=['POST'])
     @login_required
@@ -385,11 +442,9 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         MIGRATE_STATE.update({'running': True, 'stage': 'backup', 'complete': False, 'error': False})
         MIGRATE_LOG.clear()
         try:
-            settings = load_settings()
-            current_cfg = get_deploy_cfg(settings, 'authentik_deployment')
             backup_script = os.path.join(SCRIPTS_DIR, 'authentik-backup.sh')
-            if current_cfg.get('target_mode') == 'remote' and (current_cfg.get('remote', {}).get('host') or '').strip():
-                current = current_cfg['remote']
+            current = _old_machine_cfg()
+            if (current.get('host') or '').strip():
                 preflight_error = _ssh_preflight(current, 'Old Authentik Machine')
                 if preflight_error:
                     _mlog(f'ERROR: {preflight_error}')
@@ -826,46 +881,45 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </div>
 
 <div class="card" id="step-backup">
-  <div class="card-title">2 &middot; Back Up Old Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(wherever Authentik runs today)</span></div>
-  <div class="hint">Auto-detected from infra-TAK's existing Authentik deployment config (local or remote) — nothing to fill in here. Live pg_dump, no downtime.</div>
-  {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
-  <button class="btn btn-primary" id="btn-backup" onclick="runStep('backup')">Run backup</button>
-  <a href="/api/authentik/migrate/backup/download"><button class="btn btn-ghost" {% if not last_backup %}disabled{% endif %}>Download tarball</button></a>
-  {% if old_machine.host %}
-  <details style="margin-top:14px">
-    <summary style="cursor:pointer;font-size:12px;color:var(--text-dim)">SSH credentials for {{ old_machine.host }} — fix these if the backup step (or Update Config &amp; Reconnect / logs / control on the Authentik page) can't connect</summary>
-    <div style="margin-top:12px">
-      <div class="row">
-        <div>
-          <label class="form-label">SSH user</label>
-          <input class="form-input" id="old-user" value="{{ old_machine.ssh_user or 'root' }}">
-        </div>
-        <div>
-          <label class="form-label">SSH port</label>
-          <input class="form-input" id="old-port" value="{{ old_machine.ssh_port or 22 }}">
-        </div>
-      </div>
-      <label class="form-label">Auth</label>
-      <select class="form-input" id="old-auth">
-        <option value="ssh_key" {% if old_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
-        <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
-      </select>
-      <input class="form-input" id="old-key" placeholder="~/.ssh/id_ed25519" value="{{ old_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
-      <div style="display:flex;gap:8px;align-items:center">
-        <input class="form-input" id="old-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
-        <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('old-pass', this)">show</button>
-      </div>
-      <div style="margin-bottom:12px"></div>
-      <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save</button>
-      <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
-      <span id="old-ssh-status" class="status"></span>
-      <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have one yet? Generate a key here, then install it using the password once — after that you never need the password again.</div>
-      <button class="btn btn-ghost" type="button" onclick="generateOldMachineSshKey()">Generate SSH key</button>
-      <button class="btn btn-ghost" type="button" onclick="installOldMachineSshKey()">Install SSH key (uses password above, once)</button>
-      <textarea class="form-input" id="old-pubkey" readonly rows="2" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;resize:vertical" placeholder="Public key appears here after Generate"></textarea>
+  <div class="card-title">2 &middot; Old Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine Authentik runs on TODAY — the backup SOURCE)</span></div>
+  <div class="hint">Enter the machine Authentik lives on now. This is deliberately separate from the New Authentik Machine so the source and destination can never be confused. Live pg_dump, no downtime.</div>
+  <div class="row">
+    <div style="flex:2">
+      <label class="form-label">Host / IP</label>
+      <input class="form-input" id="old-host" placeholder="192.0.2.20" value="{{ old_machine.host or '' }}">
     </div>
-  </details>
-  {% endif %}
+    <div>
+      <label class="form-label">SSH user</label>
+      <input class="form-input" id="old-user" value="{{ old_machine.ssh_user or 'root' }}">
+    </div>
+    <div>
+      <label class="form-label">SSH port</label>
+      <input class="form-input" id="old-port" value="{{ old_machine.ssh_port or 22 }}">
+    </div>
+  </div>
+  <label class="form-label">Auth</label>
+  <select class="form-input" id="old-auth">
+    <option value="ssh_key" {% if old_machine.auth_method != 'password' %}selected{% endif %}>SSH key</option>
+    <option value="password" {% if old_machine.auth_method == 'password' %}selected{% endif %}>Password</option>
+  </select>
+  <input class="form-input" id="old-key" placeholder="~/.ssh/id_ed25519" value="{{ old_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
+  <div style="display:flex;gap:8px;align-items:center">
+    <input class="form-input" id="old-pass" type="password" autocomplete="new-password" style="margin-bottom:0" placeholder="{% if old_machine.ssh_password %}(saved — leave blank to keep it){% else %}SSH password (if using password auth){% endif %}">
+    <button type="button" class="btn btn-ghost" style="flex-shrink:0;padding:9px 12px" onclick="toggleShowPassword('old-pass', this)">show</button>
+  </div>
+  <div style="margin-bottom:12px"></div>
+  <button class="btn btn-ghost" type="button" onclick="saveOldMachineCreds()">Save Old Authentik Machine</button>
+  <button class="btn btn-ghost" type="button" onclick="testOldMachineSsh()">Test SSH</button>
+  <span id="old-ssh-status" class="status"></span>
+  <div class="hint" style="margin-top:12px;margin-bottom:6px">Password auth flaky, or don't have one yet? Generate a migration key here, then install it using the password once — after that you never need the password again.</div>
+  <button class="btn btn-ghost" type="button" onclick="generateOldMachineSshKey()">Generate SSH key</button>
+  <button class="btn btn-ghost" type="button" onclick="installOldMachineSshKey()">Install SSH key (uses password above, once)</button>
+  <textarea class="form-input" id="old-pubkey" readonly rows="2" style="font-family:'JetBrains Mono',monospace;font-size:11px;margin-top:10px;resize:vertical" placeholder="Public key appears here after Generate"></textarea>
+  <div style="margin:16px 0 0;border-top:1px solid var(--border,#333);padding-top:14px">
+    {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
+    <button class="btn btn-primary" id="btn-backup" onclick="runBackup()">Run backup</button>
+    <a href="/api/authentik/migrate/backup/download"><button class="btn btn-ghost" {% if not last_backup %}disabled{% endif %}>Download tarball</button></a>
+  </div>
 </div>
 
 <div class="card" id="step-restore">
@@ -965,6 +1019,7 @@ function installNewMachineSshKey(){
 }
 function collectOldMachineCreds(){
   return {
+    host: document.getElementById('old-host').value.trim(),
     ssh_user: document.getElementById('old-user').value.trim() || 'root',
     ssh_port: parseInt(document.getElementById('old-port').value) || 22,
     auth_method: document.getElementById('old-auth').value,
@@ -987,34 +1042,33 @@ function testOldMachineSsh(){
   });
 }
 function generateOldMachineSshKey(){
-  // Reuses infra-TAK's own Authentik-remote key endpoint -- "Old Authentik
-  // Machine" IS authentik_deployment.remote, so no need for a separate key.
-  // Passing config.remote.auth_method here matters: that endpoint only ever
-  // persists ssh_key_path on its own, never auth_method, so without this
-  // override generating a key would leave auth_method saved as "password"
-  // even though the UI dropdown flips to "SSH key" -- the backup step
-  // reads the saved value, not the dropdown, and would keep trying (and
-  // failing) password auth regardless of a freshly generated, uninstalled-
-  // looking-installed key.
+  // Generates a dedicated migration key (infra-tak-authentik-migrate) owned by
+  // this wizard, saved onto the Old Authentik Machine config -- NOT the console's
+  // shared Authentik-remote key. Save the form first so the key lands on the
+  // host you actually typed.
   var st=document.getElementById('old-ssh-status'); st.textContent='generating key...'; st.className='status';
-  fetch('/api/authentik/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:{remote:{auth_method:'ssh_key'}}}),credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{
-      if(!d||!d.success){ st.textContent=(d&&d.error)||'key generation failed'; st.className='status err'; return; }
-      if(d.key_path) document.getElementById('old-key').value=d.key_path;
-      document.getElementById('old-auth').value='ssh_key';
-      document.getElementById('old-pubkey').value=d.public_key||'';
-      st.textContent='key ready, saved as this target auth method'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
-    });
+  saveOldMachineCreds(function(){
+    fetch('/api/authentik/migrate/old-machine/ensure-ssh-key',{method:'POST',credentials:'same-origin'})
+      .then(r=>r.json()).then(d=>{
+        if(!d||!d.success){ st.textContent=(d&&d.error)||'key generation failed'; st.className='status err'; return; }
+        if(d.key_path) document.getElementById('old-key').value=d.key_path;
+        document.getElementById('old-auth').value='ssh_key';
+        document.getElementById('old-pubkey').value=d.public_key||'';
+        st.textContent='key ready'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
+      });
+  });
 }
 function installOldMachineSshKey(){
   var pw=document.getElementById('old-pass').value;
   if(!pw){ alert('Type the password in the field above first — used once to install the key, then you can switch auth to SSH key and never need it again.'); return; }
   var st=document.getElementById('old-ssh-status'); st.textContent='installing key...'; st.className='status';
-  fetch('/api/authentik/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
-    .then(r=>r.json()).then(d=>{
-      st.textContent=(d&&d.success)?'key installed — you can switch auth to SSH key now':((d&&d.error)||'install failed');
-      st.className='status '+((d&&d.success)?'ok':'err');
-    });
+  saveOldMachineCreds(function(){
+    fetch('/api/authentik/migrate/old-machine/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw}),credentials:'same-origin'})
+      .then(r=>r.json()).then(d=>{
+        st.textContent=(d&&d.success)?'key installed — you can switch auth to SSH key now':((d&&d.error)||'install failed');
+        st.className='status '+((d&&d.success)?'ok':'err');
+      });
+  });
 }
 var pollTimer=null;
 var pollStage=null;
@@ -1043,6 +1097,11 @@ function pollLog(){
 }
 function setButtons(disabled){
   ['btn-backup','btn-restore','btn-repoint'].forEach(id=>document.getElementById(id).disabled=disabled);
+}
+function runBackup(){
+  // Persist the Old Authentik Machine form before backing up, so it always
+  // runs against exactly what's on screen (never a stale saved source).
+  saveOldMachineCreds(function(){ runStep('backup'); });
 }
 function runStep(step, extraBody){
   setButtons(true);
