@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.9.1'
+MODULE_VERSION = '1.9.2'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -131,7 +131,7 @@ def _install_ssh_key_via_password(cfg, host, one_time_password):
     """ssh-copy-id equivalent: append this console's public key to the target's
     authorized_keys, authenticating with a password supplied just for this call
     (not necessarily the same as any password saved for ongoing use)."""
-    kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '~/.ssh/infra-tak-migrate-authentik-new')
+    kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '/root/.ssh/infra-tak-authentik-new')
     pub = kp + '.pub'
     if not os.path.exists(pub):
         return False, 'Generate the SSH key first'
@@ -263,14 +263,14 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     @login_required
     def authentik_migrate_new_machine_ensure_ssh_key():
         cfg = _new_machine_cfg()
-        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '~/.ssh/infra-tak-migrate-authentik-new')
+        kp = os.path.expanduser((cfg.get('ssh_key_path') or '').strip() or '/root/.ssh/infra-tak-authentik-new')
         pub = kp + '.pub'
         if not os.path.exists(kp):
             kdir = os.path.dirname(kp)
             if kdir and not os.path.isdir(kdir):
                 os.makedirs(kdir, mode=0o700, exist_ok=True)
             try:
-                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-migrate-authentik-new'],
+                subprocess.run(['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-authentik-new'],
                                capture_output=True, text=True, timeout=30, check=True)
             except Exception as e:
                 return jsonify({'success': False, 'error': f'ssh-keygen failed: {e}'}), 500
