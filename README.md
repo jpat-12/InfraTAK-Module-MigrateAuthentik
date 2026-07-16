@@ -15,14 +15,14 @@ into the console process.
 
 | Wizard step | Runs on | Script |
 |---|---|---|
-| Back up the current machine | wherever Authentik lives today — detected automatically (local console box, or the console's configured remote) | `authentik-backup.sh` |
-| Copy + restore on the new machine | the new machine, over SSH with credentials you enter in the wizard | `authentik-restore.sh` |
-| Point console + Caddy at the new machine | this console host | `authentik-repoint-caddy.sh` |
+| Back up Old Authentik Machine | wherever Authentik lives today — detected automatically (local console box, or the console's configured remote) | `authentik-backup.sh` |
+| Copy + restore on New Authentik Machine | the new machine, over SSH with credentials you enter in the wizard | `authentik-restore.sh` |
+| Point console + Caddy at New Authentik Machine | this console host | `authentik-repoint-caddy.sh` |
 
-"Current machine" = wherever Authentik runs today (nothing to configure — the
-module reads it from infra-TAK's existing deployment settings). "New
-machine" = the destination you're migrating Authentik to; you enter its
-SSH details in step 1 of the wizard.
+**Old Authentik Machine** = wherever Authentik runs today (nothing to
+configure — the module reads it from infra-TAK's existing deployment
+settings). **New Authentik Machine** = the destination you're migrating
+Authentik to; you enter its SSH details in step 1 of the wizard.
 
 Live output from each step streams into a log panel in the browser, the same
 way infra-TAK streams deploy logs elsewhere in the console.
@@ -89,22 +89,22 @@ console integration. Safe to run even if the module isn't installed.
 
 ## Using the wizard
 
-1. **New machine** — enter the destination box's host/IP and SSH credentials
-   (key or password), then **Test SSH**. This is the machine you're moving
-   Authentik *to*.
-2. **Back up the current machine** — click **Run backup**. Nothing to fill
+1. **New Authentik Machine** — enter the destination box's host/IP and SSH
+   credentials (key or password), then **Test SSH**. This is the machine
+   you're moving Authentik *to*.
+2. **Back Up Old Authentik Machine** — click **Run backup**. Nothing to fill
    in; it auto-detects wherever Authentik runs today. No downtime; it's a
    live `pg_dump`. Avoid making admin changes in Authentik between this step
    and cutover.
-3. **Restore on the new machine** — copies the tarball + installs Docker if
-   needed, restores the database before Authentik ever starts against it,
-   brings the stack up. Uses the new machine from step 1. The log panel
-   reports the candidate IPs the new machine detected for itself.
-4. **Point console + Caddy at the new machine** — enter the IP from step 3
-   (or `127.0.0.1` if the new machine IS this console) and click **Point
-   console + Caddy now**. This updates `.config/settings.json`'s
+3. **Restore on New Authentik Machine** — copies the tarball + installs
+   Docker if needed, restores the database before Authentik ever starts
+   against it, brings the stack up. Uses the New Authentik Machine from
+   step 1. The log panel reports the candidate IPs it detected for itself.
+4. **Point Console + Caddy at New Authentik Machine** — enter the IP from
+   step 3 (or `127.0.0.1` if the New Authentik Machine IS this console) and
+   click **Point console + Caddy now**. This updates `.config/settings.json`'s
    `authentik_deployment` and rewrites the Caddy upstream.
-5. Finish the cutover manually: stop the old (current) machine, verify
+5. Finish the cutover manually: stop the Old Authentik Machine, verify
    DNS/firewall, run **Update Config & Reconnect** on the Authentik page,
    verify logins, then decommission the old box.
 

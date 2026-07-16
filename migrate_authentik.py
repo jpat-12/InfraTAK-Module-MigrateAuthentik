@@ -9,11 +9,11 @@ What it does:
   - Wraps the scripts/authentik-migrate/*.sh toolkit (backup / restore /
     repoint-caddy) behind a wizard page reachable from a "Migrate" button on
     the Authentik page.
-  - Backs up Authentik wherever it currently lives — the "current machine",
-    detected automatically from infra-TAK's existing Authentik deployment
-    config (local or remote) — copies the tarball to a "new machine" you
-    enter SSH details for in the wizard, restores it there, and repoints
-    Caddy + console settings at that new machine.
+  - Backs up Authentik wherever it currently lives — the "Old Authentik
+    Machine", detected automatically from infra-TAK's existing Authentik
+    deployment config (local or remote) — copies the tarball to a "New
+    Authentik Machine" you enter SSH details for in the wizard, restores it
+    there, and repoints Caddy + console settings at the New Authentik Machine.
   - Ships a self-update action that git-pulls this module's own source repo
     and re-syncs it into the running console (see install.sh), so the module
     can be updated from a button instead of SSHing in by hand.
@@ -128,7 +128,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         )
 
     # ------------------------------------------------------------------
-    # New machine SSH setup (the destination you're migrating Authentik to)
+    # New Authentik Machine SSH setup (the destination you're migrating Authentik to)
     # ------------------------------------------------------------------
     @app.route('/api/authentik/migrate/new-machine', methods=['POST'])
     @login_required
@@ -150,12 +150,12 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     def authentik_migrate_test_new_machine_ssh():
         cfg = _new_machine_cfg()
         if not _ssh_new_machine_ok(cfg):
-            return jsonify({'error': 'New machine host not configured'}), 400
+            return jsonify({'error': 'New Authentik Machine host not configured'}), 400
         ok, out = ssh_probe(cfg, 'echo ok && uname -a', timeout=15)
         return jsonify({'success': ok, 'output': out})
 
     # ------------------------------------------------------------------
-    # Step 1 — back up the current machine (wherever Authentik lives today)
+    # Step 1 — back up the Old Authentik Machine (wherever Authentik lives today)
     # ------------------------------------------------------------------
     def _run_backup():
         MIGRATE_STATE.update({'running': True, 'stage': 'backup', 'complete': False, 'error': False})
@@ -166,13 +166,13 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             backup_script = os.path.join(SCRIPTS_DIR, 'authentik-backup.sh')
             if current_cfg.get('target_mode') == 'remote' and (current_cfg.get('remote', {}).get('host') or '').strip():
                 current = current_cfg['remote']
-                _mlog(f"Current machine is remote ({current.get('host')}) — copying backup script over...")
+                _mlog(f"Old Authentik Machine is remote ({current.get('host')}) — copying backup script over...")
                 ok, out = _scp_to_new_machine(current, backup_script, '/root/authentik-backup.sh')
                 if not ok:
-                    _mlog(f'ERROR: could not copy backup script to current machine: {out}')
+                    _mlog(f'ERROR: could not copy backup script to Old Authentik Machine: {out}')
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
-                _mlog('Running backup on the current machine (pg_dump, no downtime)...')
+                _mlog('Running backup on the Old Authentik Machine (pg_dump, no downtime)...')
                 ok, out = ssh_probe(current, 'bash /root/authentik-backup.sh /root', timeout=600)
                 _mlog(out)
                 if not ok:
@@ -203,7 +203,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                     MIGRATE_STATE.update({'running': False, 'error': True})
                     return
             else:
-                _mlog('Current machine is this console — running backup locally (pg_dump, no downtime)...')
+                _mlog('Old Authentik Machine is this console — running backup locally (pg_dump, no downtime)...')
                 ok, out = _run_local(f'bash "{backup_script}" "{WORK_DIR}"', timeout=600)
                 _mlog(out)
                 if not ok:
@@ -242,7 +242,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return send_file(path, as_attachment=True)
 
     # ------------------------------------------------------------------
-    # Step 2 — copy + restore on the new machine
+    # Step 2 — copy + restore on the New Authentik Machine
     # ------------------------------------------------------------------
     def _run_restore():
         MIGRATE_STATE.update({'running': True, 'stage': 'restore', 'complete': False, 'error': False})
@@ -250,7 +250,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         try:
             cfg = _new_machine_cfg()
             if not _ssh_new_machine_ok(cfg):
-                _mlog('ERROR: new machine not configured — fill in step 1 first')
+                _mlog('ERROR: New Authentik Machine not configured — fill in step 1 first')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
             state = _load_state(load_settings)
@@ -272,7 +272,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                 _mlog(f'ERROR copying restore script: {out}')
                 MIGRATE_STATE.update({'running': False, 'error': True})
                 return
-            _mlog('Running restore on the new machine (Docker install if needed, DB restore, stack up)...')
+            _mlog('Running restore on the New Authentik Machine (Docker install if needed, DB restore, stack up)...')
             ok, out = ssh_probe(cfg, f'bash /root/authentik-restore.sh {remote_tarball}', timeout=900)
             _mlog(out)
             if not ok:
@@ -299,7 +299,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
         return jsonify({'success': True})
 
     # ------------------------------------------------------------------
-    # Step 3 — point Caddy + console settings at the new machine
+    # Step 3 — point Caddy + console settings at the New Authentik Machine
     # ------------------------------------------------------------------
     def _run_repoint(new_ip):
         MIGRATE_STATE.update({'running': True, 'stage': 'repoint', 'complete': False, 'error': False})
@@ -459,11 +459,11 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </style></head>
 <body>
 <a class="back" href="/authentik">&larr; Back to Authentik</a>
-<h1>Migrate Authentik to a new machine</h1>
-<div class="sub">Backs up Authentik from the machine it runs on today (detected automatically — no input needed), restores it on the new machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the current machine destructively.</div>
+<h1>Migrate Authentik to a New Authentik Machine</h1>
+<div class="sub">Backs up Authentik from the Old Authentik Machine (detected automatically — no input needed), restores it on the New Authentik Machine you specify below, then points Caddy + this console at it. Mirrors scripts/authentik-migrate — nothing here touches the old machine destructively.</div>
 
 <div class="card">
-  <div class="card-title">1 &middot; New machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine you're moving Authentik TO)</span></div>
+  <div class="card-title">1 &middot; New Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(the machine you're moving Authentik TO)</span></div>
   <div class="row">
     <div style="flex:2">
       <label class="form-label">Host / IP</label>
@@ -485,13 +485,13 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
   </select>
   <input class="form-input" id="new-key" placeholder="~/.ssh/id_ed25519" value="{{ new_machine.ssh_key_path or '~/.ssh/id_ed25519' }}">
   <input class="form-input" id="new-pass" type="password" placeholder="SSH password (if using password auth)">
-  <button class="btn btn-ghost" onclick="saveNewMachine()">Save new machine</button>
+  <button class="btn btn-ghost" onclick="saveNewMachine()">Save New Authentik Machine</button>
   <button class="btn btn-ghost" onclick="testNewMachineSsh()">Test SSH</button>
   <span id="ssh-status" class="status"></span>
 </div>
 
 <div class="card">
-  <div class="card-title">2 &middot; Back up the current machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(wherever Authentik runs today)</span></div>
+  <div class="card-title">2 &middot; Back Up Old Authentik Machine <span style="text-transform:none;font-weight:400;color:var(--text-dim)">(wherever Authentik runs today)</span></div>
   <div class="hint">Auto-detected from infra-TAK's existing Authentik deployment config (local or remote) — nothing to fill in here. Live pg_dump, no downtime.</div>
   {% if last_backup %}<div class="hint">Last backup: {{ last_backup.path }} ({{ last_backup.created }})</div>{% endif %}
   <button class="btn btn-primary" id="btn-backup" onclick="runStep('backup')">Run backup</button>
@@ -499,14 +499,14 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 </div>
 
 <div class="card">
-  <div class="card-title">3 &middot; Restore on the new machine</div>
-  <div class="hint">Copies the backup + installs Docker if needed, restores the DB before Authentik ever boots against it, brings the stack up. Uses the new machine from step 1.</div>
-  <button class="btn btn-primary" id="btn-restore" onclick="runStep('restore')">Copy + restore on new machine</button>
+  <div class="card-title">3 &middot; Restore on New Authentik Machine</div>
+  <div class="hint">Copies the backup + installs Docker if needed, restores the DB before Authentik ever boots against it, brings the stack up. Uses the New Authentik Machine from step 1.</div>
+  <button class="btn btn-primary" id="btn-restore" onclick="runStep('restore')">Copy + Restore on New Authentik Machine</button>
 </div>
 
 <div class="card">
-  <div class="card-title">4 &middot; Point console + Caddy at the new machine</div>
-  <div class="hint">Runs locally on this console. Enter the IP the restore step reported (or 127.0.0.1 if the new machine IS this console).</div>
+  <div class="card-title">4 &middot; Point Console + Caddy at New Authentik Machine</div>
+  <div class="hint">Runs locally on this console. Enter the IP the restore step reported (or 127.0.0.1 if the New Authentik Machine IS this console).</div>
   <input class="form-input" id="caddy-ip" placeholder="New Authentik IP" value="{{ chosen_ip or '' }}">
   <button class="btn btn-primary" id="btn-repoint" onclick="runRepoint()">Point console + Caddy now</button>
 </div>
