@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.9.0'
+MODULE_VERSION = '1.9.1'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -962,14 +962,21 @@ function testOldMachineSsh(){
 function generateOldMachineSshKey(){
   // Reuses infra-TAK's own Authentik-remote key endpoint -- "Old Authentik
   // Machine" IS authentik_deployment.remote, so no need for a separate key.
+  // Passing config.remote.auth_method here matters: that endpoint only ever
+  // persists ssh_key_path on its own, never auth_method, so without this
+  // override generating a key would leave auth_method saved as "password"
+  // even though the UI dropdown flips to "SSH key" -- the backup step
+  // reads the saved value, not the dropdown, and would keep trying (and
+  // failing) password auth regardless of a freshly generated, uninstalled-
+  // looking-installed key.
   var st=document.getElementById('old-ssh-status'); st.textContent='generating key...'; st.className='status';
-  fetch('/api/authentik/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({}),credentials:'same-origin'})
+  fetch('/api/authentik/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:{remote:{auth_method:'ssh_key'}}}),credentials:'same-origin'})
     .then(r=>r.json()).then(d=>{
       if(!d||!d.success){ st.textContent=(d&&d.error)||'key generation failed'; st.className='status err'; return; }
       if(d.key_path) document.getElementById('old-key').value=d.key_path;
       document.getElementById('old-auth').value='ssh_key';
       document.getElementById('old-pubkey').value=d.public_key||'';
-      st.textContent='key ready'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
+      st.textContent='key ready and saved as this target\'s auth method'+(d.fingerprint?(' | '+d.fingerprint):''); st.className='status ok';
     });
 }
 function installOldMachineSshKey(){
