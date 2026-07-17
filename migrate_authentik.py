@@ -33,7 +33,7 @@ import time
 # Bump on every change that ships to installed consoles (semver: breaking.feature.fix).
 # This is the single source of truth — install.sh reads it back out of this file with
 # grep, no separate VERSION file to keep in sync.
-MODULE_VERSION = '1.9.3'
+MODULE_VERSION = '1.10.0'
 
 MIGRATE_KEY = 'authentik_migration'
 MODULE_REPO_URL = 'https://github.com/jpat-12/InfraTAK-Module-MigrateAuthentik.git'
@@ -159,6 +159,44 @@ def _install_ssh_key_via_password(cfg, host, one_time_password):
         hint = _diagnose_ssh_failure(out)
         return False, (hint or out or 'install failed')
     return True, None
+
+
+def _takportal_installed():
+    try:
+        r = subprocess.run('docker ps -a --filter name=tak-portal --format "{{.Names}}"',
+                            shell=True, capture_output=True, text=True, timeout=10)
+        return bool((r.stdout or '').strip())
+    except Exception:
+        return False
+
+
+def _trigger_takportal_reconfigure(load_settings, cookie_header):
+    """Ask the console's own TAK Portal control API to rebuild settings.json
+    (AUTHENTIK_URL included, recomputed from whatever authentik_deployment
+    now says) and restart the container. Deliberately calls infra-TAK's
+    existing POST /api/takportal/control {action: reconfigure} instead of
+    reimplementing that settings-building logic here -- that endpoint
+    already handles TAK Server certs, email settings, CloudTAK URL, the
+    Authentik proxy-chain heal, etc., and reimplementing it would drift out
+    of sync with infra-TAK's own behavior over time. Runs as the same
+    console process on localhost, so it authenticates by forwarding the
+    caller's own session cookie rather than needing separate credentials."""
+    import urllib.request as _ur
+    import ssl
+    port = load_settings().get('console_port', 5001)
+    req = _ur.Request(
+        f'https://127.0.0.1:{port}/api/takportal/control',
+        data=json.dumps({'action': 'reconfigure'}).encode(),
+        headers={'Content-Type': 'application/json', 'Cookie': cookie_header},
+        method='POST',
+    )
+    ctx = ssl._create_unverified_context()
+    try:
+        with _ur.urlopen(req, timeout=90, context=ctx) as resp:
+            body = json.loads(resp.read().decode())
+            return bool(body.get('success')), body.get('message') or body.get('error') or ''
+    except Exception as e:
+        return False, str(e)
 
 
 def register_routes(app, login_required, load_settings, save_settings, ssh_probe, get_deploy_cfg):
@@ -527,7 +565,7 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
     # ------------------------------------------------------------------
     # Step 3 — point Caddy + console settings at the New Authentik Machine
     # ------------------------------------------------------------------
-    def _run_repoint(new_ip):
+    def _run_repoint(new_ip, cookie_header=''):
         MIGRATE_STATE.update({'running': True, 'stage': 'repoint', 'complete': False, 'error': False})
         MIGRATE_LOG.clear()
         try:
@@ -571,6 +609,17 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
                             _mlog("Copied the New Authentik Machine's SSH credentials into the console's "
                                   "Authentik deployment target, so Update Config & Reconnect / logs / "
                                   "control work without re-entering them.")
+                # TAK Portal's AUTHENTIK_URL is computed from authentik_deployment at
+                # settings-build time -- it doesn't auto-update just because Authentik
+                # moved. Push a refresh through infra-TAK's own reconfigure endpoint
+                # (which also restarts the container) so TAK Portal actually points at
+                # the New Authentik Machine instead of silently keeping the old address.
+                if _takportal_installed():
+                    _mlog('Refreshing TAK Portal settings (AUTHENTIK_URL) and restarting it...')
+                    tp_ok, tp_msg = _trigger_takportal_reconfigure(load_settings, cookie_header)
+                    _mlog(('TAK Portal: ' if tp_ok else 'WARNING: TAK Portal reconfigure failed: ') + (tp_msg or ('ok' if tp_ok else 'unknown error')))
+                else:
+                    _mlog('TAK Portal not installed — skipping its settings refresh.')
             MIGRATE_STATE.update({'running': False, 'complete': ok, 'error': not ok, 'stage': 'repoint'})
         except Exception as e:
             _mlog(f'ERROR: {e}')
@@ -583,7 +632,12 @@ def register_routes(app, login_required, load_settings, save_settings, ssh_probe
             return jsonify({'error': 'Migration step already in progress'}), 409
         data = request.get_json() or {}
         new_ip = (data.get('ip') or '').strip()
-        threading.Thread(target=_run_repoint, args=(new_ip,), daemon=True).start()
+        # request.cookies only exists inside this request's context -- _run_repoint
+        # runs in a background thread, where Flask's request proxy is unavailable,
+        # so the cookie needed to call the TAK Portal API as this same logged-in
+        # user has to be captured here and passed in explicitly.
+        cookie_header = '; '.join(f'{k}={v}' for k, v in request.cookies.items())
+        threading.Thread(target=_run_repoint, args=(new_ip, cookie_header), daemon=True).start()
         return jsonify({'success': True})
 
     @app.route('/api/authentik/migrate/log')
@@ -861,7 +915,7 @@ a.back{color:var(--cyan);text-decoration:none;font-size:12px}
 
 <div class="card" id="step-done" style="display:none">
   <div class="card-title">Done</div>
-  <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine (its SSH credentials were also copied onto the console's Authentik deployment target, so remote features keep working). Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
+  <div class="hint" style="margin-bottom:0">Console + Caddy now point at the New Authentik Machine (its SSH credentials were also copied onto the console's Authentik deployment target, so remote features keep working). If TAK Portal is installed, its settings (AUTHENTIK_URL) were refreshed and it was restarted automatically. Finish the cutover by hand: stop the Old Authentik Machine, verify DNS/firewall (including locking down LDAP 389/636 to the console's IP on the new box), run <strong>Update Config &amp; Reconnect</strong> on the Authentik page, verify logins, then decommission the old box.</div>
 </div>
 
 <script>
